@@ -1,0 +1,66 @@
+---
+- name: RHEL System Performance Diagnostic Info Collection
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    diag_dir: "/var/tmp/diag_data_{{ ansible_date_time.epoch }}"
+
+  tasks:
+    - name: Ensure diagnostic tools are installed (sysstat, perf, iotop)
+      ansible.builtin.package:
+        name:
+          - sysstat
+          - perf
+          - iotop
+        state: present
+
+    - name: Create diagnostic data directory with timestamp
+      ansible.builtin.file:
+        path: "{{ diag_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Collect sosreport (batch mode, no interaction)
+      ansible.builtin.command:
+        cmd: "sos report --batch --tmp-dir {{ diag_dir }}"
+      async: 600
+      poll: 15
+      register: sos_result
+
+    - name: Collect perf data for 10 seconds (system-wide)
+      ansible.builtin.command:
+        cmd: "perf record -a -g -o {{ diag_dir }}/perf.data sleep 10"
+
+    - name: Convert perf data into readable report
+      ansible.builtin.command:
+        cmd: "perf report -i {{ diag_dir }}/perf.data --stdio"
+      register: perf_report
+
+    - name: Save perf report to file
+      ansible.builtin.copy:
+        content: "{{ perf_report.stdout }}"
+        dest: "{{ diag_dir }}/perf_report.txt"
+
+    - name: Collect iotop data for 10 seconds (5 iterations x 2s)
+      ansible.builtin.command:
+        cmd: "iotop -b -n 5 -d 2"
+      register: iotop_result
+
+    - name: Save iotop output to file
+      ansible.builtin.copy:
+        content: "{{ iotop_result.stdout }}"
+        dest: "{{ diag_dir }}/iotop_output.txt"
+
+    - name: Show diagnostic data location
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "Diagnostic data collection complete."
+          - "All files saved to: {{ diag_dir }}"
+          - "  - sosreport : {{ diag_dir }}/sosreport-*.tar.xz"
+          - "  - perf data : {{ diag_dir }}/perf.data"
+          - "  - perf report: {{ diag_dir }}/perf_report.txt"
+          - "  - iotop output: {{ diag_dir }}/iotop_output.txt"
+          - "========================================"
