@@ -13,6 +13,9 @@
 #   Prometheus scrape target (e.g. "server01.example.com:9100").
 #   The port suffix ":9100" is stripped and passed as job limit so
 #   the job template runs only on the alerting host.
+#
+# Throttle: once_within 5 minutes per host instance, so repeated alerts
+#   from the same host within 5 minutes trigger only one job run.
 
 - name: Alertmanager Resource Pressure Auto-Remediation
   hosts: all
@@ -31,6 +34,10 @@
          event.payload.commonLabels.alertname == "high_load" or
          event.payload.commonLabels.alertname == "HostCpuIsUnderUtilized" or
          event.payload.commonLabels.alertname == "HostCpuStealNoisyNeighbor")
+      throttle:
+        once_within: 5 minutes
+        group_by_attributes:
+          - event.payload.commonLabels.instance
       action:
         run_job_template:
           name: Info_Collection
@@ -46,6 +53,10 @@
          event.payload.commonLabels.alertname == "HostOutOfMemory" or
          event.payload.commonLabels.alertname == "HostMemoryUnderMemoryPressure" or
          event.payload.commonLabels.alertname == "HostSwapIsFillingUp")
+      throttle:
+        once_within: 5 minutes
+        group_by_attributes:
+          - event.payload.commonLabels.instance
       action:
         run_job_template:
           name: Info_Collection
@@ -61,6 +72,10 @@
          event.payload.commonLabels.alertname == "HostUnusualDiskWriteRate" or
          event.payload.commonLabels.alertname == "HostUnusualDiskReadLatency" or
          event.payload.commonLabels.alertname == "HostUnusualDiskWriteLatency")
+      throttle:
+        once_within: 5 minutes
+        group_by_attributes:
+          - event.payload.commonLabels.instance
       action:
         run_job_template:
           name: Info_Collection
@@ -78,6 +93,10 @@
          event.payload.commonLabels.alertname == "HostNetworkTransmitErrors" or
          event.payload.commonLabels.alertname == "HostNetworkInterfaceSaturated" or
          event.payload.commonLabels.alertname == "HostConntrackLimit")
+      throttle:
+        once_within: 5 minutes
+        group_by_attributes:
+          - event.payload.commonLabels.instance
       action:
         run_job_template:
           name: Info_Collection
@@ -93,6 +112,10 @@
          event.payload.commonLabels.alertname == "HostDiskWillFillIn24Hours" or
          event.payload.commonLabels.alertname == "HostOutOfInodes" or
          event.payload.commonLabels.alertname == "Disk_used_Hight")
+      throttle:
+        once_within: 5 minutes
+        group_by_attributes:
+          - event.payload.commonLabels.instance
       action:
         run_job_template:
           name: Info_Collection
