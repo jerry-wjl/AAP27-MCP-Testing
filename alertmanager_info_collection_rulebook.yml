@@ -1,0 +1,101 @@
+---
+# Rulebook: alertmanager_info_collection_rulebook.yml
+#
+# Purpose : Receive Alertmanager webhook events via AAP EDA event stream
+#           and automatically trigger job template "Info_Collection" on
+#           the exact host that raised the alert.
+#
+# Event source : ansible.eda.webhook (fronted by AAP EDA event stream)
+#   Alertmanager webhook URL (already configured):
+#   https://aap27.example.com:443/eda-event-streams/api/eda/v1/external_event_stream/da8ffc3d-94cc-42ce-acd0-711887c0ca63/post/
+#
+# Host targeting: event.payload.commonLabels.instance carries the
+#   Prometheus scrape target (e.g. "server01.example.com:9100").
+#   The port suffix ":9100" is stripped and passed as job limit so
+#   the job template runs only on the alerting host.
+
+- name: Alertmanager Resource Pressure Auto-Remediation
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+
+    # ─── CPU ──────────────────────────────────────────────────────────────────
+    - name: CPU Pressure - Trigger Info Collection
+      condition: >
+        event.payload.status == "firing" and
+        (event.payload.commonLabels.alertname == "hostCpuUsageAlert" or
+         event.payload.commonLabels.alertname == "high_load" or
+         event.payload.commonLabels.alertname == "HostCpuIsUnderUtilized" or
+         event.payload.commonLabels.alertname == "HostCpuStealNoisyNeighbor")
+      action:
+        run_job_template:
+          name: Info_Collection
+          organization: Default
+          job_args:
+            limit: "{{ event.payload.commonLabels.instance.split(':')[0] }}"
+
+    # ─── Memory ───────────────────────────────────────────────────────────────
+    - name: Memory Pressure - Trigger Info Collection
+      condition: >
+        event.payload.status == "firing" and
+        (event.payload.commonLabels.alertname == "hostMemUsageAlert" or
+         event.payload.commonLabels.alertname == "HostOutOfMemory" or
+         event.payload.commonLabels.alertname == "HostMemoryUnderMemoryPressure" or
+         event.payload.commonLabels.alertname == "HostSwapIsFillingUp")
+      action:
+        run_job_template:
+          name: Info_Collection
+          organization: Default
+          job_args:
+            limit: "{{ event.payload.commonLabels.instance.split(':')[0] }}"
+
+    # ─── Disk IO ──────────────────────────────────────────────────────────────
+    - name: Disk IO Pressure - Trigger Info Collection
+      condition: >
+        event.payload.status == "firing" and
+        (event.payload.commonLabels.alertname == "HostUnusualDiskReadRate" or
+         event.payload.commonLabels.alertname == "HostUnusualDiskWriteRate" or
+         event.payload.commonLabels.alertname == "HostUnusualDiskReadLatency" or
+         event.payload.commonLabels.alertname == "HostUnusualDiskWriteLatency")
+      action:
+        run_job_template:
+          name: Info_Collection
+          organization: Default
+          job_args:
+            limit: "{{ event.payload.commonLabels.instance.split(':')[0] }}"
+
+    # ─── Network ──────────────────────────────────────────────────────────────
+    - name: Network Bandwidth Pressure - Trigger Info Collection
+      condition: >
+        event.payload.status == "firing" and
+        (event.payload.commonLabels.alertname == "HostUnusualNetworkThroughputIn" or
+         event.payload.commonLabels.alertname == "HostUnusualNetworkThroughputOut" or
+         event.payload.commonLabels.alertname == "HostNetworkReceiveErrors" or
+         event.payload.commonLabels.alertname == "HostNetworkTransmitErrors" or
+         event.payload.commonLabels.alertname == "HostNetworkInterfaceSaturated" or
+         event.payload.commonLabels.alertname == "HostConntrackLimit")
+      action:
+        run_job_template:
+          name: Info_Collection
+          organization: Default
+          job_args:
+            limit: "{{ event.payload.commonLabels.instance.split(':')[0] }}"
+
+    # ─── Filesystem ───────────────────────────────────────────────────────────
+    - name: Filesystem Pressure - Trigger Info Collection
+      condition: >
+        event.payload.status == "firing" and
+        (event.payload.commonLabels.alertname == "HostOutOfDiskSpace" or
+         event.payload.commonLabels.alertname == "HostDiskWillFillIn24Hours" or
+         event.payload.commonLabels.alertname == "HostOutOfInodes" or
+         event.payload.commonLabels.alertname == "Disk_used_Hight")
+      action:
+        run_job_template:
+          name: Info_Collection
+          organization: Default
+          job_args:
+            limit: "{{ event.payload.commonLabels.instance.split(':')[0] }}"
