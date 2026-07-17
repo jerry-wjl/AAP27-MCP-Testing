@@ -1,0 +1,72 @@
+---
+- name: RHEL Performance Diagnostic Data Collection
+  hosts: all
+  become: true
+
+  tasks:
+
+    - name: Ensure diagnostic packages are installed (sysstat, perf, iotop)
+      package:
+        name:
+          - sysstat
+          - perf
+          - iotop
+        state: present
+
+    - name: Ensure sos package is installed (RHEL 9.x only)
+      package:
+        name: sos
+        state: present
+      when:
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "9"
+
+    - name: Get current timestamp
+      command: date +%Y%m%d_%H%M%S
+      register: ts
+      changed_when: false
+
+    - name: Set diagnostic directory path
+      set_fact:
+        diag_dir: "/var/tmp/diag_data_{{ ts.stdout }}"
+
+    - name: Create diagnostic directory
+      file:
+        path: "{{ diag_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Collect sosreport (RHEL 9.x only)
+      command: sos report --batch --tmp-dir {{ diag_dir }}
+      when:
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "9"
+      async: 600
+      poll: 15
+
+    - name: Record perf data for 10 seconds (system-wide)
+      command: perf record -a -g -o {{ diag_dir }}/perf.data -- sleep 10
+
+    - name: Generate readable perf report
+      command: perf report -i {{ diag_dir }}/perf.data --stdio
+      register: perf_report
+      changed_when: false
+
+    - name: Save perf report to file
+      copy:
+        content: "{{ perf_report.stdout }}"
+        dest: "{{ diag_dir }}/perf_report.txt"
+
+    - name: Collect iotop output for 10 seconds (5 iterations x 2s delay)
+      command: iotop -b -n 5 -d 2
+      register: iotop_output
+      changed_when: false
+
+    - name: Save iotop output to file
+      copy:
+        content: "{{ iotop_output.stdout }}"
+        dest: "{{ diag_dir }}/iotop_output.txt"
+
+    - name: Show diagnostic data location
+      debug:
+        msg: "All diagnostic data collected and saved to: {{ diag_dir }} on {{ inventory_hostname }}"
