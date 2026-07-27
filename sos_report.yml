@@ -1,0 +1,32 @@
+---
+- name: Collect SOS report on all managed hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure sos package is installed
+      ansible.builtin.package:
+        name: sos
+        state: present
+
+    - name: Run sos report in batch mode
+      ansible.builtin.command:
+        cmd: sos report --batch
+      register: sos_result
+      changed_when: true
+
+    - name: Extract sos report file path from output
+      ansible.builtin.set_fact:
+        sos_report_path: >-
+          {{ (sos_result.stdout + '\n' + sos_result.stderr)
+             | regex_search('(/var/tmp/\S+\.tar\.xz)') | default('') }}
+
+    - name: Print sos report location
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "Host     : {{ inventory_hostname }}"
+          - "SOS report saved at:"
+          - "  {{ sos_report_path if sos_report_path else 'Path not detected — check /var/tmp/ manually' }}"
+          - "========================================"

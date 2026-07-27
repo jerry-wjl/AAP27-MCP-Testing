@@ -1,0 +1,64 @@
+---
+- name: Capture and analyze perf hotspots on all managed hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    perf_duration: 30
+    perf_top_n: 20
+
+  tasks:
+    - name: Ensure perf package is installed
+      ansible.builtin.package:
+        name: perf
+        state: present
+
+    - name: Set perf output directory path
+      ansible.builtin.set_fact:
+        perf_dir: "/tmp/perf-{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Create perf output directory
+      ansible.builtin.file:
+        path: "{{ perf_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Record system-wide perf data (all CPUs, call graph, {{ perf_duration }}s)
+      ansible.builtin.command:
+        cmd: "perf record -a -g -o {{ perf_dir }}/perf.data sleep {{ perf_duration }}"
+      register: perf_record_result
+      changed_when: true
+
+    - name: Convert perf.data to readable text report
+      ansible.builtin.shell:
+        cmd: >
+          perf report -i {{ perf_dir }}/perf.data
+          --stdio --no-children
+          > {{ perf_dir }}/perf.txt 2>&1
+      register: perf_report_result
+      changed_when: true
+
+    - name: Extract top hotspot functions from perf report
+      ansible.builtin.shell:
+        cmd: >
+          awk '/^[[:space:]]+[0-9]+\.[0-9]+%/{
+            overhead=$1; cmd=$2;
+            symbol=""; for(i=4; i<=NF; i++) symbol=symbol" "$i;
+            printf "%-10s %-20s %s\n", overhead, cmd, symbol
+          }' {{ perf_dir }}/perf.txt | head -{{ perf_top_n }}
+      register: hotspot_result
+      changed_when: false
+
+    - name: Print hotspot analysis results
+      ansible.builtin.debug:
+        msg:
+          - "======================================================="
+          - "Perf Hotspot Analysis — {{ inventory_hostname }}"
+          - "Directory : {{ perf_dir }}"
+          - "Duration  : {{ perf_duration }}s | Top {{ perf_top_n }} functions"
+          - "======================================================="
+          - "Overhead   Process              Symbol"
+          - "-------------------------------------------------------"
+          - "{{ hotspot_result.stdout_lines | join('\n') }}"
+          - "======================================================="

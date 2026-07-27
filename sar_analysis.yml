@@ -1,0 +1,91 @@
+---
+- name: SAR report analysis for high CPU and Memory usage
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    cpu_idle_threshold: 20    # Flag when %idle drops below this (i.e. CPU usage > 80%)
+    mem_used_threshold: 80    # Flag when %memused rises above this
+    result_limit: 10          # Max rows to show per category
+
+  tasks:
+    - name: Ensure sysstat package is installed
+      ansible.builtin.package:
+        name: sysstat
+        state: present
+
+    - name: Set SAR output directory
+      ansible.builtin.set_fact:
+        sar_dir: "/tmp/sar-{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Create SAR output directory
+      ansible.builtin.file:
+        path: "{{ sar_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Find the latest saXX binary file in /var/log/sa
+      ansible.builtin.shell:
+        cmd: ls -t /var/log/sa/sa[0-9][0-9] 2>/dev/null | head -1
+      register: latest_sa_file
+      changed_when: false
+
+    - name: Fail if no sa binary files found
+      ansible.builtin.fail:
+        msg: >
+          No sa binary files found in /var/log/sa/.
+          Ensure sysstat is installed and the sa service (sysstat-collect.timer) is active.
+      when: latest_sa_file.stdout | length == 0
+
+    - name: Derive sarXX output filename from saXX
+      ansible.builtin.set_fact:
+        sa_file: "{{ latest_sa_file.stdout }}"
+        sar_filename: "{{ latest_sa_file.stdout | basename | regex_replace('^sa', 'sar') }}.txt"
+
+    - name: Convert saXX to readable sarXX report (all metrics)
+      ansible.builtin.shell:
+        cmd: "sar -A -f {{ sa_file }} > {{ sar_dir }}/{{ sar_filename }} 2>&1"
+      changed_when: true
+
+    - name: Find high CPU usage periods (idle < {{ cpu_idle_threshold }}%)
+      ansible.builtin.shell:
+        cmd: |
+          sar -u -f {{ sa_file }} | \
+          awk '/^[0-9][0-9]:[0-9][0-9]/ {
+            idle=$NF+0
+            if (idle < {{ cpu_idle_threshold }}) {
+              printf "Time: %-12s  CPU_Used: %-9s  %%idle: %s\n",
+                     $1, sprintf("%.2f%%", 100 - idle), idle"%"
+            }
+          }' | head -{{ result_limit }}
+      register: high_cpu_result
+      changed_when: false
+
+    - name: Find high memory usage periods (memused > {{ mem_used_threshold }}%)
+      ansible.builtin.shell:
+        cmd: |
+          sar -r -f {{ sa_file }} | awk '
+            /%memused/ { for (i=1; i<=NF; i++) if ($i == "%memused") col=i }
+            /^[0-9][0-9]:[0-9][0-9]/ && col && $col+0 > {{ mem_used_threshold }} {
+              printf "Time: %-12s  MemUsed: %s\n", $1, $col"%"
+            }' | head -{{ result_limit }}
+      register: high_mem_result
+      changed_when: false
+
+    - name: Print SAR analysis results
+      ansible.builtin.debug:
+        msg:
+          - "========================================================="
+          - "SAR Analysis — {{ inventory_hostname }}"
+          - "Source  : {{ sa_file }}"
+          - "Report  : {{ sar_dir }}/{{ sar_filename }}"
+          - "========================================================="
+          - ">>> High CPU Periods  (usage > {{ 100 - cpu_idle_threshold }}%)"
+          - "---------------------------------------------------------"
+          - "{{ high_cpu_result.stdout if high_cpu_result.stdout else 'No high CPU periods detected' }}"
+          - "---------------------------------------------------------"
+          - ">>> High Memory Periods  (memused > {{ mem_used_threshold }}%)"
+          - "---------------------------------------------------------"
+          - "{{ high_mem_result.stdout if high_mem_result.stdout else 'No high memory periods detected' }}"
+          - "========================================================="
