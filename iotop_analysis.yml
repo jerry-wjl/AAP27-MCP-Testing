@@ -1,79 +1,77 @@
 ---
-- name: Capture and analyze iotop data for high disk IO processes
+- name: Capture and analyze disk IO data for high disk IO processes
   hosts: all
   become: true
   gather_facts: true
 
   vars:
-    iotop_duration: 30     # Total capture duration in seconds
-    iotop_interval: 1      # Snapshot interval in seconds
-    io_top_n: 10           # Top N processes/threads to report
+    io_duration: 30      # Total capture duration in seconds
+    io_interval: 1       # Snapshot interval in seconds
+    io_top_n: 10         # Top N processes to report
 
   tasks:
-    - name: Ensure iotop package is installed
+    - name: Ensure sysstat package is installed
       ansible.builtin.package:
-        name: iotop
+        name: sysstat
         state: present
 
-    - name: Set iotop output directory
+    - name: Set output directory
       ansible.builtin.set_fact:
-        iotop_dir: "/tmp/iotop-{{ ansible_date_time.iso8601_basic_short }}"
-        iotop_snapshots: "{{ (iotop_duration / iotop_interval) | int }}"
+        io_dir: "/tmp/diskio-{{ ansible_date_time.iso8601_basic_short }}"
 
-    - name: Create iotop output directory
+    - name: Create output directory
       ansible.builtin.file:
-        path: "{{ iotop_dir }}"
+        path: "{{ io_dir }}"
         state: directory
         mode: "0755"
 
-    - name: Run iotop for {{ iotop_duration }}s ({{ (iotop_duration / iotop_interval) | int }} snapshots, {{ iotop_interval }}s interval)
+    - name: Run pidstat -d for {{ io_duration }}s ({{ io_duration }} snapshots, {{ io_interval }}s interval)
       ansible.builtin.shell:
         cmd: >
-          iotop -b
-          -n {{ (iotop_duration / iotop_interval) | int }}
-          -d {{ iotop_interval }}
-          > {{ iotop_dir }}/iotop_output.txt 2>&1
+          pidstat -d {{ io_interval }} {{ io_duration }}
+          > {{ io_dir }}/pidstat_output.txt 2>&1
       changed_when: true
 
-    - name: Show raw iotop output (first 40 lines for format diagnosis)
-      ansible.builtin.shell:
-        cmd: head -40 {{ iotop_dir }}/iotop_output.txt || echo "(file empty or missing)"
-      register: iotop_raw
-      changed_when: false
-
-    - name: Print raw iotop output
-      ansible.builtin.debug:
-        msg: "{{ iotop_raw.stdout_lines }}"
-
-    - name: Find top {{ io_top_n }} processes by peak disk IO usage
+    - name: Find top {{ io_top_n }} processes by total disk IO (read+write KB/s)
       ansible.builtin.shell:
         cmd: |
-          grep -E '^\s+[0-9]' {{ iotop_dir }}/iotop_output.txt | \
+          grep -E '^\s*[0-9]+\s+[0-9]+' {{ io_dir }}/pidstat_output.txt | \
           awk '
           {
-            tid=$1; user=$3
-            read=$4" "$5; write=$6" "$7
-            io=$10+0
-            cmd=$12; for(i=13; i<=NF; i++) cmd=cmd" "$i
-            if (io > peak[tid]) {
-              peak[tid] = io
-              info[tid] = sprintf("IO%%: %-7s TID: %-7s User: %-12s Read: %-12s Write: %-12s CMD: %s",
-                                  io"%", tid, user, read, write, cmd)
+            pid=$3; user=$2
+            read=$4; write=$5
+            iops=(read+0)+(write+0)
+            cmd=$NF
+            if (iops > peak[pid]) {
+              peak[pid] = iops
+              info[pid] = sprintf("PID: %-7s User: %-12s kB_rd/s: %-10s kB_wr/s: %-10s CMD: %s",
+                                  pid, user, read, write, cmd)
             }
           }
           END {
-            for (tid in peak) print peak[tid], info[tid]
+            for (pid in peak) print peak[pid], info[pid]
           }' | sort -rn | head -{{ io_top_n }} | awk '{$1=""; sub(/^ /, ""); print}'
       register: io_top_result
       changed_when: false
 
-    - name: Print top disk IO processes
+    - name: Get system-wide disk IO summary
+      ansible.builtin.shell:
+        cmd: >
+          grep -E '^\s*[0-9]+\s+[0-9]+' {{ io_dir }}/pidstat_output.txt |
+          awk '{r+=$4; w+=$5; n++} END {printf "Avg kB_rd/s: %.2f  Avg kB_wr/s: %.2f  Samples: %d\n", r/n, w/n, n}'
+      register: io_summary
+      changed_when: false
+
+    - name: Print disk IO analysis results
       ansible.builtin.debug:
         msg:
           - "========================================================="
           - "Disk IO Analysis — {{ inventory_hostname }}"
-          - "Directory  : {{ iotop_dir }}"
-          - "Duration   : {{ iotop_duration }}s | {{ iotop_snapshots }} snapshots | top {{ io_top_n }}"
+          - "Directory  : {{ io_dir }}"
+          - "Duration   : {{ io_duration }}s | {{ io_duration }} snapshots | top {{ io_top_n }}"
+          - "Tool       : pidstat -d (sysstat)"
+          - "========================================================="
+          - "System summary: {{ io_summary.stdout }}"
           - "========================================================="
           - "{{ io_top_result.stdout_lines | join('\n') if io_top_result.stdout else 'No disk IO activity detected during capture window' }}"
           - "========================================================="
