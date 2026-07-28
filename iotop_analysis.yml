@@ -35,6 +35,16 @@
           > {{ iotop_dir }}/iotop_output.txt 2>&1
       changed_when: true
 
+    - name: Show raw iotop output (first 40 lines for format diagnosis)
+      ansible.builtin.shell:
+        cmd: head -40 {{ iotop_dir }}/iotop_output.txt || echo "(file empty or missing)"
+      register: iotop_raw
+      changed_when: false
+
+    - name: Print raw iotop output
+      ansible.builtin.debug:
+        msg: "{{ iotop_raw.stdout_lines }}"
+
     - name: Find top {{ io_top_n }} processes by peak disk IO usage
       ansible.builtin.shell:
         cmd: |
