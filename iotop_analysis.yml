@@ -38,8 +38,11 @@
           grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}' {{ io_dir }}/pidstat_output.txt | \
           awk '
           {
-            pid=$3; user=$2
-            read=$4+0; write=$5+0
+            if ($2 == "AM" || $2 == "PM") {
+              user=$3; pid=$4; read=$5+0; write=$6+0
+            } else {
+              user=$2; pid=$3; read=$4+0; write=$5+0
+            }
             iops=read+write
             cmd=$NF
             if (iops > peak[pid]) {
@@ -58,7 +61,10 @@
       ansible.builtin.shell:
         cmd: |
           grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}' {{ io_dir }}/pidstat_output.txt | \
-          awk '{r+=$4; w+=$5; n++} END {
+          awk '{
+            if ($2 == "AM" || $2 == "PM") { r+=$5; w+=$6 } else { r+=$4; w+=$5 }
+            n++
+          } END {
             if (n > 0)
               printf "Avg kB_rd/s: %.2f  Avg kB_wr/s: %.2f  Samples: %d\n", r/n, w/n, n
             else
