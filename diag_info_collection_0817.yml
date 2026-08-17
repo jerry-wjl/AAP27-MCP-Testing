@@ -1,0 +1,61 @@
+---
+- name: RHEL Performance Diagnostic Information Collection
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Set diagnostic directory name with timestamp
+      ansible.builtin.set_fact:
+        diag_dir: "/var/tmp/diag_data_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Ensure diagnostic packages are installed (sysstat, perf, iotop)
+      ansible.builtin.package:
+        name:
+          - sysstat
+          - perf
+          - iotop
+        state: present
+
+    - name: Create diagnostic data directory
+      ansible.builtin.file:
+        path: "{{ diag_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Collect sosreport (RHEL 9.x hosts only)
+      ansible.builtin.command:
+        cmd: "sos report --batch --tmp-dir {{ diag_dir }}"
+      when:
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "9"
+      register: sos_result
+      changed_when: true
+
+    - name: Record perf data for 10 seconds (all CPUs, with call graph)
+      ansible.builtin.command:
+        cmd: "perf record -a -g -o {{ diag_dir }}/perf.data sleep 10"
+      register: perf_record_result
+      changed_when: true
+
+    - name: Convert perf.data to readable report
+      ansible.builtin.shell:
+        cmd: "perf report -i {{ diag_dir }}/perf.data --stdio > {{ diag_dir }}/perf_report.txt 2>&1"
+      register: perf_report_result
+      changed_when: true
+
+    - name: Collect iotop output for 10 seconds (10 iterations x 1s)
+      ansible.builtin.shell:
+        cmd: "iotop -b -t -n 10 -d 1 > {{ diag_dir }}/iotop_output.txt 2>&1"
+      register: iotop_result
+      changed_when: true
+
+    - name: Show diagnostic data collection location
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "Diagnostic data saved to: {{ diag_dir }}"
+          - "  perf_report.txt  — CPU performance report"
+          - "  iotop_output.txt — I/O activity (10s)"
+          - "  sosreport-*.tar.xz — sos report (RHEL 9.x only)"
+          - "========================================="
