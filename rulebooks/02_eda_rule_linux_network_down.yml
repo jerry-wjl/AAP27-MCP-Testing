@@ -1,0 +1,47 @@
+---
+# =============================================================================
+# Rulebook (AAP UI / Event Stream 版本)
+# -----------------------------------------------------------------------------
+# 用途：匹配「网络接口异常」类告警，调用 Job Template 启动修复 Playbook。
+# 设计点同 01_eda_rule_linuxperformancealerts_ui.yml。
+# =============================================================================
+
+- name: "Linux Network Interface Down Alerts (AAP UI / Event Stream)"
+  hosts: all
+
+  sources:
+    - name: "AAP Event Stream webhook listener"
+      ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  execution_strategy: sequential
+
+  rules:
+    - name: "Linux network alerts — match NetworkInterfaceDown"
+      condition: >-
+        event.payload.groupLabels.alertname is defined and
+        event.payload.groupLabels.alertname == "NetworkInterfaceDown"
+      actions:
+        - debug:
+            msg: |
+              Linux Network Interface Down Alert received from AAP Event Stream
+              -------------------------------------------------------------
+              Alert Name     : {{ event.payload.groupLabels.alertname }}
+              Instance       : {{ event.payload.commonLabels.instance }}
+              Instance Name  : {{ event.payload.commonLabels.instance_name }}
+              Device         : {{ event.payload.commonLabels.device }}
+              Severity       : {{ event.payload.commonLabels.severity }}
+              Status         : {{ event.payload.status }}
+              Receiver       : {{ event.payload.receiver }}
+              -------------------------------------------------------------
+              FULL EVENT PAYLOAD:
+              {{ event.payload }}
+
+        - run_job_template:
+            name: "02_EDA_action_network_down_UI"
+            organization: "Default"
+            job_args:
+              limit: "{{ event.payload.commonLabels.instance_name }}"
+              extra_vars:
+                webhook_payload: "{{ event.payload }}"
