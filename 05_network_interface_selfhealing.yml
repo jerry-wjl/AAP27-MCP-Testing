@@ -1,0 +1,403 @@
+# Self-Healing：找出 DOWN 网卡 → 自动修复 → 健康检查 → Markdown 报告 → 上传 Mattermost
+#
+# 流程：
+#   Phase 1  扫描所有物理网卡，挑出 state DOWN 的（排除 lo / docker / br / virbr / veth / cni 等）
+#   Phase 2  逐个尝试 `ip link set <dev> up`；3s 后若仍未 UP，再用 `nmcli connection up` 兜底
+#   Phase 3  修复后健康检查：ip a / ip -br link / 各网卡 carrier+operstate / 默认路由连通
+#   Phase 4  生成 .md 报告，debug 打印 + 保存到 /tmp/<hostname>-<时间戳>.md
+#   Phase 5  经控制节点中转上传到 Mattermost (10.210.65.14):/network_report/
+#
+# 安全约束：
+#   PROTECTED_DEVS（默认 ens34）—— 管理网卡永不允许被关闭，即使被识别为 DOWN 也跳过。
+#
+# AAP Survey（可选）：
+#   Answer variable name : target_group
+#   示例                 : Chaos.example.com / Issue_servers
+#
+# 手动运行：
+#   ansible-playbook 05_network_interface_selfhealing.yml -e target_group=Chaos.example.com
+---
+- name: "Self-Healing: bring DOWN network interfaces back up"
+  hosts: "{{ target_group | default('Issue_servers') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    # 受保护网卡：永不操作（避免远程失联）
+    protected_devices:
+      - ens34
+    # 修复后等待网卡 settle 的秒数
+    settle_seconds: 3
+    nm_fallback_wait: 5
+
+    mattermost_host: "10.210.65.14"
+    mattermost_report_dir: "/network_report"
+    controller_staging_dir: "/tmp/network_selfhealing_staging"
+
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+    report_filename: "{{ ansible_hostname }}-{{ timestamp_suffix }}.md"
+    local_report_path: "/tmp/{{ report_filename }}"
+
+  tasks:
+
+    # ===========================================
+    # Phase 1：发现故障网卡
+    # ===========================================
+    - name: "Scan for DOWN physical interfaces (excluding lo / docker / br / virbr / veth / cni / kube)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ip -o link show \
+          | awk -F': ' '{print $2" "$0}' \
+          | grep -v -E '^(lo|veth|docker|br-|virbr|cni|cilium|kube|vnet|tun|tap)' \
+          | awk '/state DOWN/ {print $1}'
+      args:
+        executable: /bin/bash
+      register: down_scan
+      changed_when: false
+
+    - name: "Filter out protected devices from target list"
+      ansible.builtin.set_fact:
+        target_devices: >-
+          {{ down_scan.stdout_lines
+             | default([])
+             | difference(protected_devices) }}
+
+    - name: "Show pre-heal snapshot"
+      ansible.builtin.debug:
+        msg:
+          - "----- DOWN interfaces detected -----"
+          - "{{ down_scan.stdout_lines | default([]) }}"
+          - "----- Protected (skipped) -----"
+          - "{{ protected_devices }}"
+          - "----- Will try to bring UP -----"
+          - "{{ target_devices }}"
+
+    - name: "Capture pre-heal ip -br link"
+      ansible.builtin.command: ip -br link
+      register: pre_brlink
+      changed_when: false
+
+    # ===========================================
+    # Phase 2：自动修复
+    # ===========================================
+    - name: "Detect NetworkManager presence"
+      ansible.builtin.command: which nmcli
+      register: nmcli_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Attempt 'ip link set <dev> up' for each target device"
+      ansible.builtin.command: "ip link set {{ item }} up"
+      loop: "{{ target_devices }}"
+      register: ip_link_results
+      ignore_errors: yes
+
+    - name: "Wait {{ settle_seconds }}s for links to settle"
+      ansible.builtin.pause:
+        seconds: "{{ settle_seconds }}"
+      when: target_devices | length > 0
+
+    - name: "Re-check operstate after ip link up"
+      ansible.builtin.shell: |
+        cat /sys/class/net/{{ item }}/operstate 2>/dev/null || echo unknown
+      args:
+        executable: /bin/bash
+      loop: "{{ target_devices }}"
+      register: operstate_mid
+      changed_when: false
+
+    - name: "Build list of devices still not UP after ip link up"
+      ansible.builtin.set_fact:
+        still_down_devices: >-
+          {{ operstate_mid.results
+             | rejectattr('stdout', 'equalto', 'up')
+             | rejectattr('stdout', 'equalto', 'unknown')
+             | map(attribute='item')
+             | list }}
+
+    - name: "Find NetworkManager connection names for still-down devices"
+      ansible.builtin.shell: |
+        nmcli -t -f NAME,DEVICE connection show \
+          | awk -F: -v dev="{{ item }}" '$2==dev {print $1; exit}'
+      args:
+        executable: /bin/bash
+      loop: "{{ still_down_devices }}"
+      register: nm_conn_names
+      when:
+        - nmcli_check.rc == 0
+        - still_down_devices | length > 0
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Fallback: nmcli connection up for still-down devices"
+      ansible.builtin.command: "nmcli connection up '{{ item.stdout | trim }}'"
+      loop: "{{ nm_conn_names.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('') }}"
+      when:
+        - nmcli_check.rc == 0
+        - still_down_devices | length > 0
+        - item.stdout is defined
+        - (item.stdout | trim) | length > 0
+      register: nmcli_up_results
+      ignore_errors: yes
+
+    - name: "Wait {{ nm_fallback_wait }}s for NetworkManager to apply changes"
+      ansible.builtin.pause:
+        seconds: "{{ nm_fallback_wait }}"
+      when:
+        - nmcli_check.rc == 0
+        - still_down_devices | length > 0
+
+    # ===========================================
+    # Phase 3：修复后健康检查
+    # ===========================================
+    - name: "Post-heal ip -br link"
+      ansible.builtin.command: ip -br link
+      register: post_brlink
+      changed_when: false
+
+    - name: "Post-heal ip -br addr"
+      ansible.builtin.command: ip -br addr
+      register: post_braddr
+      changed_when: false
+
+    - name: "Post-heal ip route"
+      ansible.builtin.command: ip route
+      register: post_route
+      changed_when: false
+
+    - name: "Collect carrier + operstate for each target device"
+      ansible.builtin.shell: |
+        for d in {{ target_devices | join(' ') }}; do
+          c=$(cat /sys/class/net/$d/carrier   2>/dev/null || echo n/a)
+          s=$(cat /sys/class/net/$d/operstate 2>/dev/null || echo n/a)
+          printf '%-12s carrier=%s  operstate=%s\n' "$d" "$c" "$s"
+        done
+      args:
+        executable: /bin/bash
+      register: post_dev_state
+      changed_when: false
+      when: target_devices | length > 0
+
+    - name: "Ping default gateway (best-effort)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        GW=$(ip route show default 0/0 | awk '/default/ {print $3; exit}')
+        if [ -n "$GW" ]; then
+          echo "Default gateway: $GW"
+          ping -c 2 -W 2 "$GW" 2>&1 || true
+        else
+          echo "No default gateway in routing table."
+        fi
+      args:
+        executable: /bin/bash
+      register: gw_ping
+      changed_when: false
+
+    - name: "Determine per-device recovery status"
+      ansible.builtin.set_fact:
+        per_device_status: >-
+          {{ per_device_status | default([]) +
+             [{
+               'device': item,
+               'operstate': (lookup('pipe', 'cat /sys/class/net/' ~ item ~ '/operstate 2>/dev/null || echo unknown') | trim),
+               'carrier':   (lookup('pipe', 'cat /sys/class/net/' ~ item ~ '/carrier   2>/dev/null || echo n/a') | trim)
+             }] }}
+      loop: "{{ target_devices }}"
+
+    - name: "Determine overall recovery_ok"
+      ansible.builtin.set_fact:
+        recovery_ok: >-
+          {{ target_devices | length == 0 or
+             (per_device_status | default([])
+               | rejectattr('operstate', 'equalto', 'up')
+               | rejectattr('operstate', 'equalto', 'unknown')
+               | list | length == 0) }}
+
+    # ===========================================
+    # Phase 4：生成 Markdown 报告
+    # ===========================================
+    - name: "Build Markdown report content"
+      ansible.builtin.set_fact:
+        report_content: |
+          # Network Interface Self-Healing Report
+
+          | Field | Value |
+          | --- | --- |
+          | Host | {{ ansible_hostname }} ({{ inventory_hostname }}) |
+          | OS | {{ ansible_distribution }} {{ ansible_distribution_version }} |
+          | Kernel | {{ ansible_kernel }} |
+          | Generated | {{ ansible_date_time.iso8601 }} |
+          | Protected devices | {{ protected_devices | join(', ') }} |
+          | Detected DOWN | {{ down_scan.stdout_lines | default([]) | join(', ') if (down_scan.stdout_lines | default([]) | length > 0) else 'None' }} |
+          | Targets | {{ target_devices | join(', ') if (target_devices | length > 0) else 'None' }} |
+          | Recovery OK | {{ recovery_ok }} |
+
+          ## 1. Pre-Heal Snapshot
+
+          ```text
+          {{ pre_brlink.stdout | trim }}
+          ```
+
+          ## 2. Heal Actions
+
+          ### 2.1 ip link set up
+
+          ```text
+          {% for r in ip_link_results.results | default([]) %}
+          {{ r.item }}: rc={{ r.rc | default('N/A') }}  {{ ('stderr=' ~ (r.stderr | default('') | trim)) if r.stderr | default('') | trim | length > 0 else '' }}
+          {% endfor %}
+          {% if (ip_link_results.results | default([])) | length == 0 %}
+          (no device needed `ip link set up`)
+          {% endif %}
+          ```
+
+          {% if still_down_devices | length > 0 %}
+          ### 2.2 nmcli connection up (fallback)
+
+          ```text
+          {% for r in nmcli_up_results.results | default([]) %}
+          {{ r.item.item | default('') }}: rc={{ r.rc | default('N/A') }}  {{ ('stderr=' ~ (r.stderr | default('') | trim)) if r.stderr | default('') | trim | length > 0 else '' }}
+          {% endfor %}
+          {% if (nmcli_up_results.results | default([])) | length == 0 %}
+          (nmcli fallback was triggered but no connection name was resolved)
+          {% endif %}
+          ```
+          {% else %}
+          ### 2.2 nmcli fallback
+          Not needed — every target device came up after `ip link set up`.
+          {% endif %}
+
+          ## 3. Post-Heal Health Check
+
+          ### 3.1 Per-device state
+
+          ```text
+          {{ post_dev_state.stdout | default('(no target devices)') | trim }}
+          ```
+
+          ### 3.2 ip -br link
+
+          ```text
+          {{ post_brlink.stdout | trim }}
+          ```
+
+          ### 3.3 ip -br addr
+
+          ```text
+          {{ post_braddr.stdout | trim }}
+          ```
+
+          ### 3.4 ip route
+
+          ```text
+          {{ post_route.stdout | trim }}
+          ```
+
+          ### 3.5 Default gateway connectivity
+
+          ```text
+          {{ gw_ping.stdout | trim }}
+          ```
+
+          ---
+
+          {% if recovery_ok %}
+          ✅ **All targeted interfaces are UP. Self-heal succeeded.**
+          {% else %}
+          ⚠️ **Some interfaces remain DOWN — likely a physical / link-layer problem (no cable, peer down, driver issue).**
+          {% endif %}
+
+          _Report auto-generated by AAP playbook `05_network_interface_selfhealing.yml`._
+
+    - name: "Print Markdown report"
+      ansible.builtin.debug:
+        msg: "{{ report_content.split('\n') }}"
+
+    - name: "Save report to /tmp/{{ report_filename }}"
+      ansible.builtin.copy:
+        content: "{{ report_content }}"
+        dest: "{{ local_report_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Stat saved report"
+      ansible.builtin.stat:
+        path: "{{ local_report_path }}"
+      register: report_stat
+
+    - name: "Fail if local report is empty"
+      ansible.builtin.fail:
+        msg: "Local report {{ local_report_path }} missing or too small."
+      when: not report_stat.stat.exists or report_stat.stat.size | int < 200
+
+    # ===========================================
+    # Phase 5：经控制节点中转 → Mattermost
+    # ===========================================
+    - name: "Prepare staging dir on controller"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: "Fetch report from fault host to controller"
+      ansible.builtin.fetch:
+        src: "{{ local_report_path }}"
+        dest: "{{ controller_staging_dir }}/{{ report_filename }}"
+        flat: true
+
+    - name: "Ensure {{ mattermost_report_dir }} exists on Mattermost"
+      ansible.builtin.file:
+        path: "{{ mattermost_report_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    - name: "Upload report to Mattermost:{{ mattermost_report_dir }}"
+      ansible.builtin.copy:
+        src: "{{ controller_staging_dir }}/{{ report_filename }}"
+        dest: "{{ mattermost_report_dir }}/{{ report_filename }}"
+        mode: "0644"
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    - name: "Verify uploaded file on Mattermost"
+      ansible.builtin.stat:
+        path: "{{ mattermost_report_dir }}/{{ report_filename }}"
+      delegate_to: "{{ mattermost_host }}"
+      register: remote_stat
+
+    - name: "Fail if upload size mismatch"
+      ansible.builtin.fail:
+        msg: >-
+          Upload verification failed:
+          local={{ report_stat.stat.size }} bytes,
+          remote={{ remote_stat.stat.size | default('N/A') }} bytes
+      when:
+        - not remote_stat.stat.exists or
+          (remote_stat.stat.size | default(0) | int) != (report_stat.stat.size | int)
+
+    - name: "Cleanup controller staging file"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}/{{ report_filename }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg:
+          - "Network interface self-healing completed"
+          - "Host           : {{ ansible_hostname }} ({{ inventory_hostname }})"
+          - "Targets healed : {{ target_devices | join(', ') if (target_devices | length > 0) else 'None' }}"
+          - "Recovery OK    : {{ recovery_ok }}"
+          - "Local file     : {{ local_report_path }} ({{ report_stat.stat.size }} B)"
+          - "Remote file    : {{ mattermost_host }}:{{ mattermost_report_dir }}/{{ report_filename }}"
+          - "View           : ssh root@{{ mattermost_host }} less {{ mattermost_report_dir }}/{{ report_filename }}"
