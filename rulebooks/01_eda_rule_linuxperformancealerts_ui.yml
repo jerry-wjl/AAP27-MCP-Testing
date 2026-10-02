@@ -1,0 +1,56 @@
+---
+# =============================================================================
+# Rulebook (AAP UI / Event Stream 版本)
+# -----------------------------------------------------------------------------
+# 用途：在 AAP 2.6 UI 下作为 Rulebook Activation 运行；接收来自 AAP
+#       Event Stream 转发过来的 Prometheus Alertmanager Webhook Payload。
+#
+# 关键改造点（相对 CMD 版本 01_eda_rule_linuxperformancealerts_n8n.yml）：
+#   1. 不再使用 run_module / run_playbook，避免 AAP UI 下
+#      "action which needs inventory to be defined" 错误。
+#   2. 全部副作用动作（写 alert 文件、调用 n8n webhook、采集性能数据）
+#      都迁移到 job_template 对应的 Playbook 中执行。
+#   3. condition 仅匹配 HighSystemCpuUsage / CriticalSystemCpuUsage 两类告警。
+#   4. 通过 job_args.extra_vars.webhook_payload 把整份 event.payload
+#      原样透传给被触发的 Job Template。
+# =============================================================================
+
+- name: "Linux Performance Alerts (AAP UI / Event Stream)"
+  hosts: all
+
+  sources:
+    - name: "AAP Event Stream webhook listener"
+      ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  execution_strategy: sequential
+
+  rules:
+    - name: "Linux perf alerts — match HighSystemCpuUsage or CriticalSystemCpuUsage"
+      condition: >-
+        event.payload.groupLabels.alertname is defined and
+        (event.payload.groupLabels.alertname == "HighSystemCpuUsage" or
+         event.payload.groupLabels.alertname == "CriticalSystemCpuUsage")
+      actions:
+        - debug:
+            msg: |
+              ✅ Linux Performance Alert received from AAP Event Stream
+              -------------------------------------------------------------
+              Alert Name     : {{ event.payload.groupLabels.alertname }}
+              Instance       : {{ event.payload.commonLabels.instance }}
+              Instance Name  : {{ event.payload.commonLabels.instance_name }}
+              Severity       : {{ event.payload.commonLabels.severity }}
+              Status         : {{ event.payload.status }}
+              Receiver       : {{ event.payload.receiver }}
+              -------------------------------------------------------------
+              FULL EVENT PAYLOAD:
+              {{ event.payload }}
+
+        - run_job_template:
+            name: "01_EDA_action_linuxperformancealerts_UI"
+            organization: "Default"
+            job_args:
+              limit: "{{ event.payload.commonLabels.instance_name }}"
+              extra_vars:
+                webhook_payload: "{{ event.payload }}"
