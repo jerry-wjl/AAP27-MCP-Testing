@@ -1,0 +1,152 @@
+# 使用 xsos 对故障服务器做快速诊断，并把 .md 报告上传到 Mattermost
+#
+# 流程：
+#   1) 在故障服务器上执行 /usr/local/bin/xsos -ya
+#      → 输出保存到 /tmp/<inventory_hostname>-<timestamp>.md
+#   2) 通过控制节点中转，把该 .md 文件推送到
+#      Mattermost (10.210.65.14):/xsos_report/<inventory_hostname>-<timestamp>.md
+#
+# 前置条件：
+#   - 故障服务器与 Mattermost 都已安装 xsos（脚本位于 /usr/local/bin/xsos）
+#   - AAP 控制节点能 SSH 到故障服务器与 Mattermost（两者均已纳入 inventory）
+#
+# 手动运行：
+#   ansible-playbook 02_xsos_report_to_mattermost.yml -l chaos.example.com
+---
+- name: "xsos quick triage → Mattermost"
+  hosts: "{{ target_group | default('Issue_servers') }}"
+  gather_facts: true
+  become: true
+
+  vars:
+    xsos_bin: "/usr/local/bin/xsos"
+    mattermost_host: "10.210.65.14"
+    mattermost_report_dir: "/xsos_report"
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+    report_filename: "{{ inventory_hostname }}-{{ timestamp_suffix }}.md"
+    local_report_path: "/tmp/{{ report_filename }}"
+    controller_staging_dir: "/tmp/xsos_staging"
+
+  tasks:
+
+    # ===========================================
+    # 第一阶段：环境检查
+    # ===========================================
+    - name: "Verify xsos is installed on the fault host"
+      ansible.builtin.stat:
+        path: "{{ xsos_bin }}"
+      register: xsos_stat
+
+    - name: "Fail early if xsos is missing"
+      ansible.builtin.fail:
+        msg: "{{ xsos_bin }} not found on {{ inventory_hostname }}. Install xsos first."
+      when: not xsos_stat.stat.exists or not xsos_stat.stat.executable
+
+    # ===========================================
+    # 第二阶段：在故障服务器生成 xsos 报告
+    # ===========================================
+    - name: "Run xsos -ya and write Markdown report to /tmp"
+      ansible.builtin.shell: |
+        set -o pipefail
+        {
+          echo "# xsos report — {{ inventory_hostname }}"
+          echo ""
+          echo "- Host       : {{ inventory_hostname }}"
+          echo "- Generated  : $(date -Iseconds)"
+          echo "- Command    : {{ xsos_bin }} -ya"
+          echo ""
+          echo '```text'
+          {{ xsos_bin }} -ya 2>&1 || true
+          echo '```'
+        } > {{ local_report_path }}
+      args:
+        executable: /bin/bash
+      register: xsos_run
+      changed_when: true
+
+    - name: "Stat the generated report on fault host"
+      ansible.builtin.stat:
+        path: "{{ local_report_path }}"
+      register: report_stat
+
+    - name: "Fail if report not generated"
+      ansible.builtin.fail:
+        msg: "Failed to generate {{ local_report_path }} (size={{ report_stat.stat.size | default(0) }})"
+      when: not report_stat.stat.exists or report_stat.stat.size | default(0) | int < 100
+
+    - name: "Show local report info"
+      ansible.builtin.debug:
+        msg:
+          - "Local report : {{ local_report_path }}"
+          - "Size (bytes) : {{ report_stat.stat.size }}"
+
+    # ===========================================
+    # 第三阶段：经控制节点中转到 Mattermost
+    # ===========================================
+    - name: "Prepare staging dir on controller"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: false
+
+    - name: "Fetch report from fault host to controller"
+      ansible.builtin.fetch:
+        src: "{{ local_report_path }}"
+        dest: "{{ controller_staging_dir }}/{{ report_filename }}"
+        flat: yes
+
+    - name: "Ensure /xsos_report exists on Mattermost"
+      ansible.builtin.file:
+        path: "{{ mattermost_report_dir }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    - name: "Upload report to Mattermost:{{ mattermost_report_dir }}"
+      ansible.builtin.copy:
+        src: "{{ controller_staging_dir }}/{{ report_filename }}"
+        dest: "{{ mattermost_report_dir }}/{{ report_filename }}"
+        mode: '0644'
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    # ===========================================
+    # 第四阶段：验证 & 汇总
+    # ===========================================
+    - name: "Verify uploaded file on Mattermost"
+      ansible.builtin.stat:
+        path: "{{ mattermost_report_dir }}/{{ report_filename }}"
+      delegate_to: "{{ mattermost_host }}"
+      register: remote_stat
+
+    - name: "Fail if upload size mismatch"
+      ansible.builtin.fail:
+        msg: >-
+          Upload verification failed:
+          local={{ report_stat.stat.size }} bytes,
+          remote={{ remote_stat.stat.size | default('N/A') }} bytes
+      when:
+        - not remote_stat.stat.exists or
+          (remote_stat.stat.size | default(0) | int) != (report_stat.stat.size | int)
+
+    - name: "Cleanup controller staging file"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}/{{ report_filename }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg:
+          - "✓ xsos report uploaded successfully"
+          - "Source host : {{ inventory_hostname }}"
+          - "Local file  : {{ local_report_path }}  ({{ report_stat.stat.size }} B)"
+          - "Remote file : {{ mattermost_host }}:{{ mattermost_report_dir }}/{{ report_filename }}"
+          - "Open with   : ssh root@{{ mattermost_host }} less {{ mattermost_report_dir }}/{{ report_filename }}"
