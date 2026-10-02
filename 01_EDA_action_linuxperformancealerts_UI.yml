@@ -1,0 +1,604 @@
+---
+# =============================================================================
+# Playbook (AAP UI / Job Template 版本)
+# -----------------------------------------------------------------------------
+# 用途：作为 EDA Rulebook (01_eda_rule_linuxperformancealerts_ui.yml)
+#       触发的 Job Template 对应的 Playbook，完成下列工作：
+#
+#   1. 把 EDA Rulebook 通过 job_args.extra_vars 传过来的 webhook_payload
+#      （即 Alertmanager 原始 Webhook Payload）落地为
+#         /tmp/<inventory_hostname>-<alertname>-alert_info.txt
+#      —— 这一步取代了 CMD 版本 rulebook 里的 run_module: copy 动作。
+#   2. 定位高负载进程：top + pidstat 快照，挑出 CPU>90% 的进程。
+#   3. 函数级性能剖析：对目标 PID 触发一次 perf record。
+#   4. 把性能数据 + alert_info 文件传输到 Triage / Diagnose Server。
+#   5. 在 Diagnose Server 上执行 perf report，合并诊断文件，生成
+#      issues_latest.txt 最终报告。
+#   6. 【最后一个 Play】调用 n8n_webhook_url，激活 n8n 工作流。
+#      —— 这一步取代了 CMD 版本 rulebook 里的 run_module: uri 动作。
+#
+# 改造要点（对比 CMD 版本 01_EDA_action_linuxperformancealerts_OK.yml）：
+#   - vars 增加 webhook_payload 默认值（防止手工执行该 Playbook 时未传参报错）。
+#   - vars 派生出 alert_name / alert_instance / alert_info_file 等便捷字段。
+#   - 新增 "Phase 0: 从 webhook_payload 生成 alert_info 文件" 阶段，
+#     代替原 rulebook 在 EDA 容器里执行的 copy 动作。
+#   - n8n_webhook_url 调用迁移到独立的最后一个 play 中执行。
+# =============================================================================
+
+- name: "Linux Performance Analysis for High CPU Usage"
+  hosts: all
+  become: true
+
+  vars:
+    perf_duration: 15
+    output_base: "/TS"
+    diagnose_server: "10.210.65.14"
+    n8n_webhook_url: "http://10.210.65.103:8080/webhook/9a1d6d25-2a9b-4906-afd7-21c3b4a49860"
+
+    # -------------------------------------------------------------------------
+    # 需求 2：EDA rulebook 通过 job_args.extra_vars.webhook_payload
+    # 把 event.payload 透传进来。这里在 vars 中给出空默认值，使本 Playbook
+    # 在手工运行（未带 extra_vars）时也不会因变量缺失而失败。
+    # 通过 extra_vars 传入的同名变量优先级最高，会覆盖此处的默认值。
+    # -------------------------------------------------------------------------
+    webhook_payload: {}
+
+    # 从 webhook_payload 抽取常用字段（带兜底默认值）
+    alert_name: >-
+      {{ (webhook_payload.groupLabels | default({})).alertname
+         | default((webhook_payload.commonLabels | default({})).alertname
+         | default('UnknownAlert')) }}
+    alert_instance: >-
+      {{ (webhook_payload.commonLabels | default({})).instance
+         | default((webhook_payload.groupLabels | default({})).instance
+         | default('UnknownInstance')) }}
+    alert_severity: >-
+      {{ (webhook_payload.commonLabels | default({})).severity | default('Unknown') }}
+    alert_status: "{{ webhook_payload.status | default('Unknown') }}"
+    alert_receiver: "{{ webhook_payload.receiver | default('Unknown') }}"
+
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+
+    alert_info_file: "/tmp/{{ inventory_hostname }}-{{ alert_name }}-alert_info.txt"
+
+  tasks:
+    # ===========================================
+    # Phase 0：从 webhook_payload 生成 alert_info 文件
+    # -------------------------------------------------
+    # 需求 4：CMD 版本里 /tmp/<host>-*-alert_info.txt 由 rulebook 的
+    # run_module: copy 写入；改造为 AAP UI 后，rulebook 不再能写远程文件，
+    # 因此改由 Playbook 在故障节点上根据 webhook_payload 直接生成该文件。
+    # ===========================================
+    - name: "Show received webhook_payload (from EDA extra_vars)"
+      ansible.builtin.debug:
+        msg: |
+          ===== Webhook payload received from EDA Rulebook =====
+          alert_name     : {{ alert_name }}
+          alert_instance : {{ alert_instance }}
+          severity       : {{ alert_severity }}
+          status         : {{ alert_status }}
+          receiver       : {{ alert_receiver }}
+          ------ full payload ------
+          {{ webhook_payload | to_nice_yaml }}
+
+    - name: "Write alert_info file on target host from webhook_payload"
+      ansible.builtin.copy:
+        dest: "{{ alert_info_file }}"
+        mode: "0644"
+        content: |
+          === ALERT INFORMATION (from AAP Event Stream) ===
+          Alert Name : {{ alert_name }}
+          Instance   : {{ alert_instance }}
+          Severity   : {{ alert_severity }}
+          Status     : {{ alert_status }}
+          Receiver   : {{ alert_receiver }}
+
+          === FULL EVENT PAYLOAD ===
+          {{ webhook_payload | to_nice_yaml }}
+
+    # ===========================================
+    # Phase 1：环境准备和工具检查
+    # ===========================================
+    - name: "Check required tools availability"
+      ansible.builtin.command: "which {{ item }}"
+      loop: [perf, pidstat]
+      register: tool_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: "Install required packages if missing"
+      ansible.builtin.dnf:
+        name:
+          - perf
+          - sysstat
+          - kernel-debuginfo
+          - kernel-debuginfo-common
+        state: present
+      when: tool_check.results | selectattr('rc', 'ne', 0) | list | length > 0
+      register: package_install
+      ignore_errors: yes
+
+    # ===========================================
+    # Phase 2：系统性能数据收集
+    # ===========================================
+    - name: "Create timestamped output directory"
+      ansible.builtin.file:
+        path: "{{ output_base }}/{{ inventory_hostname }}-{{ timestamp_suffix }}"
+        state: directory
+        mode: '0755'
+      register: output_dir
+
+    - name: "Capture system load snapshot with top (limited to 30 lines)"
+      ansible.builtin.shell: "top -b -n 1 | head -n 30"
+      register: top_output
+      changed_when: false
+
+    - name: "Record CPU usage statistics with pidstat (sorted by CPU usage, limited to 30 lines)"
+      ansible.builtin.shell: |
+        pidstat -u -p ALL 1 5 | \
+        awk 'NR<=3 || ($8 != "" && $8 != "0.00" && $8 != "CPU") {print}' | \
+        sort -k8 -nr | \
+        head -n 30
+      register: pidstat_output
+      changed_when: false
+
+    - name: "Find processes with CPU usage greater than 90%"
+      ansible.builtin.shell: |
+        ps -eo pid,%cpu --sort=-%cpu | awk '$2 > 90 {print $1}'
+      register: high_cpu_processes
+      changed_when: false
+
+    - name: "Fail if no processes with CPU usage greater than 90% found"
+      ansible.builtin.fail:
+        msg: "No process found with CPU usage > 90%"
+      when: high_cpu_processes.stdout == ""
+
+    - name: "Get the first process ID with high CPU usage"
+      ansible.builtin.set_fact:
+        pid: "{{ high_cpu_processes.stdout_lines[0] }}"
+
+    - name: "Display target process info"
+      ansible.builtin.debug:
+        msg: "Targeting PID {{ pid }} for perf recording"
+
+    # ===========================================
+    # Phase 3：perf 性能分析数据收集
+    # ===========================================
+    - name: "Combine top and pidstat output into single file"
+      ansible.builtin.copy:
+        content: |
+          === TOP COMMAND OUTPUT  ===
+          {{ top_output.stdout }}
+
+          === PIDSTAT COMMAND OUTPUT (Sorted by CPU usage) ===
+          {{ pidstat_output.stdout }}
+
+          === TARGET PROCESS FOR PERF ===
+          PID: {{ pid }}
+        dest: "{{ output_dir.path }}/system_analysis.txt"
+        mode: '0644'
+
+    - name: "Record performance data using perf for the process (with debug symbols)"
+      ansible.builtin.shell: |
+        echo "Starting perf record for PID {{ pid }}"
+        perf record -p {{ pid }} -a -g --call-graph dwarf -- sleep {{ perf_duration }} > {{ output_dir.path }}/perf_output.log 2>&1
+      args:
+        chdir: "{{ output_dir.path }}"
+      register: perf_record_output
+      ignore_errors: yes
+
+    - name: "Verify perf.data creation"
+      ansible.builtin.stat:
+        path: "{{ output_dir.path }}/perf.data"
+      register: perf_data_check
+
+    - name: "Check for perf.data in other locations if not found"
+      ansible.builtin.find:
+        paths: "{{ output_dir.path }}"
+        patterns: "perf.data*"
+        recurse: yes
+      register: perf_data_search
+      when: not perf_data_check.stat.exists
+
+    - name: "Display perf execution results and debugging info"
+      ansible.builtin.debug:
+        msg: |
+          perf command execution details:
+          - Return code: {{ perf_record_output.rc | default('N/A') }}
+          - stdout: {{ perf_record_output.stdout | default('N/A') }}
+          - stderr: {{ perf_record_output.stderr | default('N/A') }}
+          - perf.data exists: {{ perf_data_check.stat.exists }}
+          - perf.data search results: {{ perf_data_search.files | default([]) | map(attribute='path') | list }}
+          - perf output log: {{ output_dir.path }}/perf_output.log
+
+    - name: "Display collection summary"
+      ansible.builtin.debug:
+        msg: |
+          Performance data collection completed:
+          - Output directory: {{ output_dir.path }}
+          - System analysis file: {{ output_dir.path }}/system_analysis.txt
+          - perf.data created: {{ perf_data_check.stat.exists }}
+          - perf.data size: {{ perf_data_check.stat.size | default('N/A') }} bytes
+          - perf.data location: {{ output_dir.path }}/perf.data
+          - perf output log: {{ output_dir.path }}/perf_output.log
+
+    # ===========================================
+    # Phase 4：诊断服务器连接和目录准备
+    # ===========================================
+    - name: "Set Triage Server variables"
+      ansible.builtin.set_fact:
+        diagnose_path: "/diagnose/{{ inventory_hostname }}-{{ timestamp_suffix }}"
+        diagnose_full_path: "/diagnose/{{ inventory_hostname }}-{{ timestamp_suffix }}/"
+
+    - name: "Test connection to Triage Server"
+      ansible.builtin.ping:
+      delegate_to: "{{ diagnose_server }}"
+      register: diagnose_ping_result
+      ignore_errors: yes
+
+    - name: "Display Triage Server connection status"
+      ansible.builtin.debug:
+        msg: "Triage Server connection: {{ 'SUCCESS' if diagnose_ping_result is succeeded else 'FAILED' }}"
+
+    - name: "Create diagnose directory on Triage Server"
+      ansible.builtin.file:
+        path: "{{ diagnose_path }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      delegate_to: "{{ diagnose_server }}"
+      register: diagnose_dir_result
+      ignore_errors: yes
+
+    - name: "Display diagnose directory creation result"
+      ansible.builtin.debug:
+        msg: "Diagnose directory creation: {{ 'SUCCESS' if diagnose_dir_result is succeeded else 'FAILED' }} - {{ diagnose_dir_result.msg | default('No message') }}"
+
+    - name: "Verify diagnose directory exists"
+      ansible.builtin.stat:
+        path: "{{ diagnose_path }}"
+      delegate_to: "{{ diagnose_server }}"
+      register: diagnose_dir_check
+      ignore_errors: yes
+
+    - name: "Display directory verification result"
+      ansible.builtin.debug:
+        msg: "Directory exists: {{ diagnose_dir_check.stat.exists | default(false) }}"
+
+    - name: "Ensure Triage Server host key is in known_hosts (source host)"
+      ansible.builtin.known_hosts:
+        name: "{{ diagnose_server }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -T 5 -H ' ~ diagnose_server) }}"
+        path: "/root/.ssh/known_hosts"
+
+    # ===========================================
+    # Phase 5：性能数据文件传输到诊断服务器
+    # ===========================================
+    - name: "Verify source directory exists before transfer"
+      ansible.builtin.stat:
+        path: "{{ output_dir.path }}"
+      register: source_dir_check
+
+    - name: "Display source directory verification"
+      ansible.builtin.debug:
+        msg: |
+          Source directory check:
+          - Path: {{ output_dir.path }}
+          - Exists: {{ source_dir_check.stat.exists }}
+          - Is directory: {{ source_dir_check.stat.isdir | default(false) }}
+
+    - name: "List source directory contents"
+      ansible.builtin.find:
+        paths: "{{ output_dir.path }}"
+        patterns: "*"
+        recurse: yes
+      register: source_files
+
+    - name: "Display source files"
+      ansible.builtin.debug:
+        msg: |
+          Source files to transfer:
+          {% for file in source_files.files | default([]) %}
+          - {{ file.path }} ({{ file.size | default(0) }} bytes)
+          {% endfor %}
+
+    - name: "Verify source directory exists on fault node"
+      ansible.builtin.command: "ls -ld {{ output_dir.path }}"
+      register: verify_ts
+      ignore_errors: yes
+
+    - name: "Display directory verification result"
+      ansible.builtin.debug:
+        msg: |
+          Directory verification on fault node:
+          - Command: ls -ld {{ output_dir.path }}
+          - Return code: {{ verify_ts.rc | default('N/A') }}
+          - Output: {{ verify_ts.stdout | default('No output') }}
+          - Error: {{ verify_ts.stderr | default('No error') }}
+
+    - name: "Transfer collected files to Triage Server using synchronize (push)"
+      ansible.posix.synchronize:
+        src: "{{ output_dir.path }}/"
+        dest: "root@{{ diagnose_server }}:{{ diagnose_full_path }}"
+        recursive: yes
+        mode: push
+      delegate_to: "{{ inventory_hostname }}"
+      register: sync_result
+      ignore_errors: yes
+      when: source_dir_check.stat.exists and source_dir_check.stat.isdir
+
+    - name: "Display synchronize transfer result"
+      ansible.builtin.debug:
+        msg: |
+          synchronize transfer result:
+          - Status: {{ 'SUCCESS' if sync_result is succeeded else 'FAILED' }}
+          - Rc: {{ sync_result.rc | default('N/A') }}
+          - Stdout: {{ sync_result.stdout | default('') }}
+          - Stderr: {{ sync_result.stderr | default('') }}
+
+    - name: "Verify files were transferred successfully"
+      ansible.builtin.find:
+        paths: "{{ diagnose_path }}"
+        patterns: "*"
+        recurse: yes
+      delegate_to: "{{ diagnose_server }}"
+      register: transferred_files
+      ignore_errors: yes
+
+    - name: "Display transferred files"
+      ansible.builtin.debug:
+        msg: |
+          Transferred files on Triage Server:
+          {% for file in transferred_files.files | default([]) %}
+          - {{ file.path }} ({{ file.size | default(0) }} bytes)
+          {% endfor %}
+
+    # ===========================================
+    # Phase 6：perf 报告生成和分析
+    # ===========================================
+    - name: "Generate perf report on Triage Server"
+      ansible.builtin.shell: |
+        cd {{ diagnose_path }}
+        perf report -g --stdio -i perf.data | head -100 > {{ inventory_hostname }}-{{ ansible_date_time.date }}_perf_01.txt
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ diagnose_server }}"
+      register: perf_report_result
+      ignore_errors: yes
+
+    - name: "Display perf report generation result"
+      ansible.builtin.debug:
+        msg: |
+          Perf report executed on Triage Server:
+          - Command return code: {{ perf_report_result.rc | default('N/A') }}
+          - Stdout: {{ perf_report_result.stdout | default('') }}
+          - Stderr: {{ perf_report_result.stderr | default('') }}
+          - Output file: {{ diagnose_path }}/{{ inventory_hostname }}-{{ ansible_date_time.date }}_perf_01.txt
+
+    - name: "Check if perf report output file exists"
+      ansible.builtin.stat:
+        path: "{{ diagnose_path }}/{{ inventory_hostname }}-{{ ansible_date_time.date }}_perf_01.txt"
+      delegate_to: "{{ diagnose_server }}"
+      register: perf_report_file
+
+    - name: "Remove original perf.data if report exists"
+      ansible.builtin.file:
+        path: "{{ diagnose_path }}/perf.data"
+        state: absent
+      delegate_to: "{{ diagnose_server }}"
+      when: perf_report_file.stat.exists
+      register: remove_perf_data
+
+    - name: "Display perf.data cleanup result"
+      ansible.builtin.debug:
+        msg: |
+          perf.data cleanup:
+          - Report file exists: {{ perf_report_file.stat.exists }}
+          - perf.data removed: {{ remove_perf_data is succeeded }}
+
+    # ===========================================
+    # Phase 7：Alert 信息文件处理
+    # -------------------------------------------------
+    # 需求 4：本阶段查找的就是 Phase 0 中新生成的
+    #         /tmp/<host>-<alertname>-alert_info.txt 文件。
+    # ===========================================
+    - name: "Find alert info files for this host IP"
+      ansible.builtin.find:
+        paths: "/tmp"
+        patterns: "{{ inventory_hostname }}-*-alert_info.txt"
+        recurse: no
+      register: alert_files
+
+    - name: "Display found alert files"
+      ansible.builtin.debug:
+        msg: |
+          Found alert files:
+          {% for file in alert_files.files %}
+          - {{ file.path }} ({{ file.mtime }})
+          {% endfor %}
+
+    - name: "Get the latest alert file"
+      ansible.builtin.set_fact:
+        latest_alert_file: "{{ alert_files.files | sort(attribute='mtime') | last }}"
+      when: alert_files.files | length > 0
+
+    - name: "Display latest alert file"
+      ansible.builtin.debug:
+        msg: "Latest alert file: {{ latest_alert_file.path }} ({{ latest_alert_file.mtime }})"
+      when: latest_alert_file is defined
+
+    - name: "Transfer latest alert file to Triage Server"
+      ansible.posix.synchronize:
+        src: "{{ latest_alert_file.path }}"
+        dest: "root@{{ diagnose_server }}:{{ diagnose_path }}/"
+        mode: push
+      delegate_to: "{{ inventory_hostname }}"
+      register: alert_transfer_result
+      ignore_errors: yes
+      when: latest_alert_file is defined
+
+    - name: "Display alert file transfer result"
+      ansible.builtin.debug:
+        msg: |
+          Alert file transfer result:
+          - Status: {{ 'SUCCESS' if alert_transfer_result is succeeded else 'FAILED' }}
+          - Rc: {{ alert_transfer_result.rc | default('N/A') }}
+          - Stdout: {{ alert_transfer_result.stdout | default('') }}
+          - Stderr: {{ alert_transfer_result.stderr | default('') }}
+          - Transferred file: {{ latest_alert_file.path | default('N/A') }}
+      when: latest_alert_file is defined
+
+    - name: "Verify alert file was transferred successfully"
+      ansible.builtin.stat:
+        path: "{{ diagnose_path }}/{{ latest_alert_file.path | basename }}"
+      delegate_to: "{{ diagnose_server }}"
+      register: alert_file_check
+      ignore_errors: yes
+      when: latest_alert_file is defined
+
+    - name: "Display alert file verification result"
+      ansible.builtin.debug:
+        msg: |
+          Alert file verification:
+          - File exists on Triage Server: {{ alert_file_check.stat.exists | default(false) }}
+          - File size: {{ alert_file_check.stat.size | default('N/A') }} bytes
+          - File path: {{ diagnose_path }}/{{ latest_alert_file.path | basename | default('N/A') }}
+      when: latest_alert_file is defined
+
+    # ===========================================
+    # Phase 8：文件合并和最终报告生成
+    # ===========================================
+    - name: "Merge all files into issues_latest.txt on Triage Server"
+      ansible.builtin.shell: |
+        cd {{ diagnose_path }}
+        ALERT_FILE="{{ latest_alert_file.path | basename | default('') }}"
+
+        if [ -n "$ALERT_FILE" ] && [ -f "$ALERT_FILE" ]; then
+          echo "=== ALERT INFO ===" > issues_latest.txt
+          cat "$ALERT_FILE" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+          echo "=== OTHER DIAGNOSTIC FILES ===" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+        else
+          echo "=== DIAGNOSTIC FILES ===" > issues_latest.txt
+          echo "" >> issues_latest.txt
+        fi
+
+        find . -maxdepth 1 -type f \( -name "*.txt" -o -name "*.log" -o -name "*.data" \) \
+          ! -name "issues_latest.txt" ! -name "$ALERT_FILE" -print0 |
+        while IFS= read -r -d '' file; do
+          echo "=== ${file#./} ===" >> issues_latest.txt
+          cat "$file" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+        done
+
+        echo "Files merged into issues_latest.txt:"
+        echo "Alert file used: $ALERT_FILE"
+        ls -la issues_latest.txt
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ diagnose_server }}"
+      register: merge_result
+      ignore_errors: yes
+
+    - name: "Display merge result"
+      ansible.builtin.debug:
+        msg: |
+          File merge completed:
+          - Return code: {{ merge_result.rc | default('N/A') }}
+          - Stdout: {{ merge_result.stdout | default('') }}
+          - Stderr: {{ merge_result.stderr | default('') }}
+          - Merged file: {{ diagnose_path }}/issues_latest.txt
+
+    - name: "Verify merged file exists"
+      ansible.builtin.stat:
+        path: "{{ diagnose_path }}/issues_latest.txt"
+      delegate_to: "{{ diagnose_server }}"
+      register: merged_file_stat
+
+    - name: "Display merged file information"
+      ansible.builtin.debug:
+        msg: |
+          Merged file verification:
+          - File exists: {{ merged_file_stat.stat.exists }}
+          - File size: {{ merged_file_stat.stat.size | default(0) }} bytes
+          - File path: {{ diagnose_path }}/issues_latest.txt
+
+    - name: "Notify Triage Server directory location"
+      ansible.builtin.debug:
+        msg: "Data transferred to Triage Server: {{ diagnose_path }}"
+
+    - name: "Pass diagnose context to next play via dummy host"
+      ansible.builtin.add_host:
+        name: "_eda_n8n_ctx"
+        groups: "eda_n8n_ctx"
+        diagnose_path: "{{ diagnose_path }}"
+        target_host: "{{ inventory_hostname }}"
+        alert_name: "{{ alert_name }}"
+        alert_instance: "{{ alert_instance }}"
+        alert_severity: "{{ alert_severity }}"
+        alert_status: "{{ alert_status }}"
+        alert_receiver: "{{ alert_receiver }}"
+        webhook_payload: "{{ webhook_payload }}"
+
+
+# =============================================================================
+# 最后一个 Play：调用 n8n_webhook_url 激活 n8n 工作流
+# -----------------------------------------------------------------------------
+# 需求 1：CMD 版本 rulebook 里的 run_module: uri 在 AAP UI 下因为没有
+# inventory context 会失败，所以把这一动作迁移到本 Playbook 最后一个 play。
+# 该 play 在 AAP controller (localhost) 上执行，不依赖故障节点。
+# =============================================================================
+- name: "Notify n8n workflow to start fault-diagnosis pipeline"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    n8n_webhook_url: "http://10.210.65.103:8080/webhook/9a1d6d25-2a9b-4906-afd7-21c3b4a49860"
+    ctx: "{{ hostvars['_eda_n8n_ctx'] | default({}) }}"
+
+  tasks:
+    - name: "Display n8n notification context"
+      ansible.builtin.debug:
+        msg: |
+          About to notify n8n workflow:
+          - URL            : {{ n8n_webhook_url }}
+          - Target host    : {{ ctx.target_host | default('Unknown') }}
+          - Alert name     : {{ ctx.alert_name | default('Unknown') }}
+          - Alert instance : {{ ctx.alert_instance | default('Unknown') }}
+          - Severity       : {{ ctx.alert_severity | default('Unknown') }}
+          - Diagnose path  : {{ ctx.diagnose_path | default('Unknown') }}
+
+    - name: "POST to n8n webhook to trigger fault-diagnosis workflow"
+      ansible.builtin.uri:
+        url: "{{ n8n_webhook_url }}"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body:
+          alert_instance: "{{ ctx.alert_instance | default('Unknown') }}"
+          alert_name: "{{ ctx.alert_name | default('Unknown') }}"
+          severity: "{{ ctx.alert_severity | default('Unknown') }}"
+          status: "{{ ctx.alert_status | default('Unknown') }}"
+          receiver: "{{ ctx.alert_receiver | default('Unknown') }}"
+          target_host: "{{ ctx.target_host | default('Unknown') }}"
+          diagnose_path: "{{ ctx.diagnose_path | default('Unknown') }}"
+          issues_latest: "{{ ctx.diagnose_path | default('') }}/issues_latest.txt"
+          webhook_payload: "{{ ctx.webhook_payload | default({}) }}"
+        status_code: [200, 201, 202, 204]
+        timeout: 15
+      register: n8n_result
+      ignore_errors: yes
+
+    - name: "Display n8n webhook invocation result"
+      ansible.builtin.debug:
+        msg: |
+          n8n webhook invocation result:
+          - Status     : {{ 'SUCCESS' if n8n_result is succeeded else 'FAILED' }}
+          - HTTP code  : {{ n8n_result.status | default('N/A') }}
+          - Response   : {{ n8n_result.json | default(n8n_result.content | default('')) }}
+          - Error msg  : {{ n8n_result.msg | default('') }}
