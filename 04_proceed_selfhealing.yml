@@ -1,0 +1,371 @@
+# Self-Healing：清理高 CPU 进程 → 重新巡检 → Markdown 报告 → 上传 Mattermost
+#
+# 流程：
+#   1) 在故障服务器执行 ps -ef，挑出 CPU > 98% 的进程并 kill
+#   2) 等待几秒后重新做一次性能巡检（uptime / top / free / df / ps top10）
+#   3) 生成 .md 格式报告，先 debug 打印，再保存到
+#      /tmp/<故障服务器hostname>-<时间戳>.md
+#   4) 经控制节点中转上传到
+#      Mattermost (10.210.65.14):/performance_report/<故障服务器hostname>-<时间戳>.md
+
+---
+- name: "Self-Healing: kill >98% CPU processes and re-inspect"
+  hosts: "{{ target_group | default('Issue_servers') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    cpu_threshold: 98
+    settle_seconds: 5
+    mattermost_host: "10.210.65.14"
+    mattermost_report_dir: "/performance_report"
+    controller_staging_dir: "/tmp/selfhealing_staging"
+
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+    report_filename: "{{ ansible_hostname }}-{{ timestamp_suffix }}.md"
+    local_report_path: "/tmp/{{ report_filename }}"
+
+  tasks:
+
+    # ===========================================
+    # Phase 1：识别 CPU > 98% 的进程
+    # -------------------------------------------
+    # 注意：ps 的 %CPU 是「进程生命周期平均值」(cputime/walltime)，
+    # 长时间运行的进程即使当前 99%，ps 显示可能很低。
+    # 必须用 top -b -n 2 -d 1 取第二次迭代的「瞬时 %CPU」。
+    # ===========================================
+    - name: "Sample real-time CPU usage via top (2 iterations, 1s apart)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        # 抓第二次迭代后的进程表（top 第一次迭代的 %CPU 与 ps 类似不准）
+        top -b -n 2 -d 1 -w 512 \
+          | awk '/^top - /{i++; next} i==2 && NF>=12 && $1 ~ /^[0-9]+$/ {print}'
+      args:
+        executable: /bin/bash
+      register: top_second_iter
+      changed_when: false
+
+    - name: "Filter processes with %CPU > {{ cpu_threshold }} (column 9 of top)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "{{ top_second_iter.stdout }}" \
+          | awk -v thr={{ cpu_threshold }} '$9+0 > thr {print}'
+      args:
+        executable: /bin/bash
+      register: high_cpu_table
+      changed_when: false
+
+    - name: "Extract PIDs from filtered top output"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "{{ top_second_iter.stdout }}" \
+          | awk -v thr={{ cpu_threshold }} '$9+0 > thr {print $1}'
+      args:
+        executable: /bin/bash
+      register: high_cpu_pids
+      changed_when: false
+
+    - name: "Show pre-kill snapshot"
+      ansible.builtin.debug:
+        msg:
+          - "----- top (iter 2) raw lines -----"
+          - "{{ top_second_iter.stdout_lines | default([]) }}"
+          - "----- Processes with %CPU > {{ cpu_threshold }} -----"
+          - "{{ high_cpu_table.stdout_lines | default([]) }}"
+          - "----- PIDs to kill -----"
+          - "{{ high_cpu_pids.stdout_lines | default([]) }}"
+
+    # ===========================================
+    # Phase 2：沿 PPID 链 kill 整条进程组
+    # -------------------------------------------
+    # 适配 multiprocessing / wrapper 启动器场景：
+    #   仅 kill worker，父进程下一秒可能 fork 出新 worker → 看着没生效
+    # 策略：
+    #   对每个高 CPU PID，沿 PPID 一路向上收集祖先，直到：
+    #     - PPID == 1（systemd/init），或
+    #     - 父进程的 comm 落在 SAFE_COMM 白名单（bash/sshd/login/...）
+    #   把整条链上的进程一次性 SIGTERM → 等 2s → 残留 SIGKILL
+    # ===========================================
+    - name: "Kill high-CPU processes AND their non-system ancestors"
+      ansible.builtin.shell: |
+        set +e
+        # 系统进程白名单：遇到这些祖先就停手，避免误杀 shell / sshd / systemd
+        SAFE_COMM="systemd init bash sh zsh fish dash tmux screen sshd login agetty cron crond sudo su nohup"
+
+        # 收集每个高 CPU PID 的整条进程链
+        declare -A KILL_SET
+        for pid in {{ high_cpu_pids.stdout_lines | join(' ') }}; do
+          current="$pid"
+          depth=0
+          while [ -n "$current" ] && [ "$current" != "1" ] && [ "$current" != "0" ] && [ $depth -lt 10 ]; do
+            KILL_SET[$current]=1
+            parent=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ')
+            [ -z "$parent" ] && break
+            parent_comm=$(ps -o comm= -p "$parent" 2>/dev/null | tr -d ' ')
+            # 父进程是系统/shell 进程 → 不再向上走
+            stop=0
+            for safe in $SAFE_COMM; do
+              if [ "$parent_comm" = "$safe" ]; then stop=1; break; fi
+            done
+            [ $stop -eq 1 ] && break
+            current="$parent"
+            depth=$((depth + 1))
+          done
+        done
+
+        ALL_PIDS=$(echo "${!KILL_SET[@]}" | tr ' ' '\n' | sort -un | tr '\n' ' ')
+        echo "Process chain to kill: $ALL_PIDS"
+        echo "-----  Snapshot before kill -----"
+        ps -o pid,ppid,user,%cpu,comm,args -p $ALL_PIDS 2>/dev/null || true
+
+        echo "-----  SIGTERM (15) -----"
+        for p in $ALL_PIDS; do kill -15 "$p" 2>/dev/null && echo "TERM $p"; done
+        sleep 2
+
+        echo "-----  SIGKILL (9) for holdouts -----"
+        for p in $ALL_PIDS; do
+          if kill -0 "$p" 2>/dev/null; then
+            kill -9 "$p" 2>/dev/null && echo "KILL $p"
+          fi
+        done
+
+        echo "kill cycle completed"
+      args:
+        executable: /bin/bash
+      register: kill_result
+      when: high_cpu_pids.stdout_lines | length > 0
+      changed_when: high_cpu_pids.stdout_lines | length > 0
+
+    - name: "No high-CPU processes found — skip kill"
+      ansible.builtin.debug:
+        msg: "No process exceeded {{ cpu_threshold }}% CPU; nothing to kill."
+      when: high_cpu_pids.stdout_lines | length == 0
+
+    - name: "Show kill result"
+      ansible.builtin.debug:
+        msg: "{{ kill_result.stdout_lines | default(['(no kill action taken)']) }}"
+
+    # ===========================================
+    # Phase 2.5：等待并验证是否真的清干净
+    # ===========================================
+    - name: "Wait {{ settle_seconds }}s for system to settle"
+      ansible.builtin.pause:
+        seconds: "{{ settle_seconds }}"
+
+    - name: "Re-sample top to verify no high-CPU survivor"
+      ansible.builtin.shell: |
+        set -o pipefail
+        top -b -n 2 -d 1 -w 512 \
+          | awk '/^top - /{i++; next} i==2 && NF>=12 && $1 ~ /^[0-9]+$/ {print}' \
+          | awk -v thr={{ cpu_threshold }} '$9+0 > thr {print}'
+      args:
+        executable: /bin/bash
+      register: post_kill_check
+      changed_when: false
+
+    - name: "Warn if a high-CPU process re-emerged (likely auto-restarted by parent/systemd)"
+      ansible.builtin.debug:
+        msg:
+          - "Post-kill check: a process is STILL > {{ cpu_threshold }}% CPU."
+          - "It may be re-spawned by a wrapper script or systemd unit."
+          - "{{ post_kill_check.stdout_lines }}"
+      when: post_kill_check.stdout_lines | length > 0
+
+    # ===========================================
+    # Phase 3：重新性能巡检
+    # ===========================================
+    - name: "Collect uptime / load"
+      ansible.builtin.command: uptime
+      register: post_uptime
+      changed_when: false
+
+    - name: "Collect top 20 lines"
+      ansible.builtin.shell: "top -b -n 1 | head -n 20"
+      register: post_top
+      changed_when: false
+
+    - name: "Collect free -h"
+      ansible.builtin.command: free -h
+      register: post_free
+      changed_when: false
+
+    - name: "Collect df -h"
+      ansible.builtin.command: df -h
+      register: post_df
+      changed_when: false
+
+    - name: "Collect top-10 CPU processes after kill"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -eo pid,user,%cpu,%mem,comm,args --sort=-%cpu | head -n 11
+      args:
+        executable: /bin/bash
+      register: post_ps_top
+      changed_when: false
+
+    # ===========================================
+    # Phase 4：生成 Markdown 报告
+    # ===========================================
+    - name: "Build Markdown report content"
+      ansible.builtin.set_fact:
+        report_content: |
+          # Self-Healing Performance Report
+
+          | Field | Value |
+          | --- | --- |
+          | Host | {{ ansible_hostname }} ({{ inventory_hostname }}) |
+          | OS | {{ ansible_distribution }} {{ ansible_distribution_version }} |
+          | Kernel | {{ ansible_kernel }} |
+          | Generated | {{ ansible_date_time.iso8601 }} |
+          | CPU threshold | > {{ cpu_threshold }} % |
+          | PIDs killed | {{ high_cpu_pids.stdout_lines | default([]) | join(', ') if (high_cpu_pids.stdout_lines | default([]) | length > 0) else 'None' }} |
+
+          ## 1. Pre-Kill Snapshot (CPU > {{ cpu_threshold }}%)
+
+          ```text
+          {{ high_cpu_table.stdout | trim }}
+          ```
+
+          ## 2. Kill Action (worker + ancestor chain)
+
+          ```text
+          {{ kill_result.stdout | default('No processes killed.') | trim }}
+          ```
+
+          {% if post_kill_check.stdout_lines | default([]) | length > 0 %}
+          > Warning: a process is STILL above {{ cpu_threshold }}% CPU after kill.
+          > It is likely re-spawned by a wrapper script or a systemd unit.
+          > Survivor list:
+          >
+          > ```text
+          > {{ post_kill_check.stdout | trim }}
+          > ```
+          {% else %}
+          > Post-kill verification passed: no process exceeds {{ cpu_threshold }}% CPU.
+          {% endif %}
+
+          ## 3. Post-Kill Inspection
+
+          ### 3.1 uptime
+
+          ```text
+          {{ post_uptime.stdout | trim }}
+          ```
+
+          ### 3.2 top (first 20 lines)
+
+          ```text
+          {{ post_top.stdout | trim }}
+          ```
+
+          ### 3.3 free -h
+
+          ```text
+          {{ post_free.stdout | trim }}
+          ```
+
+          ### 3.4 df -h
+
+          ```text
+          {{ post_df.stdout | trim }}
+          ```
+
+          ### 3.5 Top 10 processes by CPU
+
+          ```text
+          {{ post_ps_top.stdout | trim }}
+          ```
+
+          ---
+
+          _Report auto-generated by AAP playbook `04_proceed_selfhealing.yml`._
+
+    - name: "Print Markdown report"
+      ansible.builtin.debug:
+        msg: "{{ report_content.split('\n') }}"
+
+    - name: "Save report to /tmp/{{ report_filename }}"
+      ansible.builtin.copy:
+        content: "{{ report_content }}"
+        dest: "{{ local_report_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Stat saved report"
+      ansible.builtin.stat:
+        path: "{{ local_report_path }}"
+      register: report_stat
+
+    - name: "Fail if local report is empty"
+      ansible.builtin.fail:
+        msg: "Local report {{ local_report_path }} missing or too small."
+      when: not report_stat.stat.exists or report_stat.stat.size | int < 200
+
+    # ===========================================
+    # Phase 5：经控制节点中转 → Mattermost
+    # ===========================================
+    - name: "Prepare staging dir on controller"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: "Fetch report from fault host to controller"
+      ansible.builtin.fetch:
+        src: "{{ local_report_path }}"
+        dest: "{{ controller_staging_dir }}/{{ report_filename }}"
+        flat: true
+
+    - name: "Ensure {{ mattermost_report_dir }} exists on Mattermost"
+      ansible.builtin.file:
+        path: "{{ mattermost_report_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    - name: "Upload report to Mattermost:{{ mattermost_report_dir }}"
+      ansible.builtin.copy:
+        src: "{{ controller_staging_dir }}/{{ report_filename }}"
+        dest: "{{ mattermost_report_dir }}/{{ report_filename }}"
+        mode: "0644"
+        owner: root
+        group: root
+      delegate_to: "{{ mattermost_host }}"
+
+    - name: "Verify uploaded file on Mattermost"
+      ansible.builtin.stat:
+        path: "{{ mattermost_report_dir }}/{{ report_filename }}"
+      delegate_to: "{{ mattermost_host }}"
+      register: remote_stat
+
+    - name: "Fail if upload size mismatch"
+      ansible.builtin.fail:
+        msg: >-
+          Upload verification failed:
+          local={{ report_stat.stat.size }} bytes,
+          remote={{ remote_stat.stat.size | default('N/A') }} bytes
+      when:
+        - not remote_stat.stat.exists or
+          (remote_stat.stat.size | default(0) | int) != (report_stat.stat.size | int)
+
+    - name: "Cleanup controller staging file"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}/{{ report_filename }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg:
+          - "Self-Healing completed"
+          - "Host        : {{ ansible_hostname }} ({{ inventory_hostname }})"
+          - "PIDs killed : {{ high_cpu_pids.stdout_lines | default([]) | join(', ') if (high_cpu_pids.stdout_lines | default([]) | length > 0) else 'None' }}"
+          - "Local file  : {{ local_report_path }} ({{ report_stat.stat.size }} B)"
+          - "Remote file : {{ mattermost_host }}:{{ mattermost_report_dir }}/{{ report_filename }}"
+          - "View        : ssh root@{{ mattermost_host }} less {{ mattermost_report_dir }}/{{ report_filename }}"
