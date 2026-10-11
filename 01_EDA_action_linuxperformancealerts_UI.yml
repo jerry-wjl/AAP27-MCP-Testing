@@ -33,7 +33,7 @@
     perf_duration: 15
     output_base: "/TS"
     diagnose_server: "10.210.65.14"
-    n8n_webhook_url: "http://10.210.65.103:8080/webhook/9a1d6d25-2a9b-4906-afd7-21c3b4a49860"
+    n8n_webhook_url: "http://10.210.65.222:8080/webhook/9a1d6d25-2a9b-4906-afd7-21c3b4a49860"
 
     # -------------------------------------------------------------------------
     # 需求 2：EDA rulebook 通过 job_args.extra_vars.webhook_payload
