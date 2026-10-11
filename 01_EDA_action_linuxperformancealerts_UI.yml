@@ -18,7 +18,7 @@
 #      —— 这一步取代了 CMD 版本 rulebook 里的 run_module: uri 动作。
 #
 # 改造要点（对比 CMD 版本 01_EDA_action_linuxperformancealerts_OK.yml）：
-#   - vars 增加 webhook_payload 默认值（防止手工执行该 Playbook 时未传参报错）。
+#   - vars 增加 _payload 默认值（防止手工执行该 Playbook 时未传参报错）。
 #   - vars 派生出 alert_name / alert_instance / alert_info_file 等便捷字段。
 #   - 新增 "Phase 0: 从 webhook_payload 生成 alert_info 文件" 阶段，
 #     代替原 rulebook 在 EDA 容器里执行的 copy 动作。
@@ -32,7 +32,7 @@
   vars:
     perf_duration: 15
     output_base: "/TS"
-    diagnose_server: "10.210.65.14"
+    diagnose_server: "10.210.65.172"
     n8n_webhook_url: "http://10.210.65.222:8080/webhook/9a1d6d25-2a9b-4906-afd7-21c3b4a49860"
 
     # -------------------------------------------------------------------------
