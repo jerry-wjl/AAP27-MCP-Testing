@@ -1,0 +1,384 @@
+---
+# sos_report_analysis — 未知故障：sos report → xsos MD → Triage → 触发 n8n
+#
+# 对应 Job Template: sos_report_analysis
+# Survey 变量:
+#   Issue_servers  — 故障主机 IP 或 inventory hostname（必填）
+#
+# 流程:
+#   1) 目标机 sos report --batch
+#   2) 解压最新 sosreport*.tar.xz
+#   3) xsos --all → sosreport_latest.md（含高危日志摘录，总大小 ≤512KiB）
+#   4) 上传至 Triage:/xsos_report/<timestamp>/sosreport_latest.md
+#   5) POST n8n webhook 激活 AI 分析
+#
+# 参考: AIOps UC3 02_xsos_report_to_mattermost.yml
+#
+# 手动运行示例:
+#   ansible-playbook 02_sos_report_analysis.yml \
+#     -e Issue_servers=10.210.65.148 \
+#     -e triage_server=10.210.65.103
+
+- name: "Bootstrap Issue_servers from Survey IP"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  # 勿写 Issue_servers: "{{ Issue_servers | default(...) }}" —— 会触发递归模板错误
+  tasks:
+    - name: "Require Issue_servers from Survey / extra_vars"
+      ansible.builtin.assert:
+        that:
+          - Issue_servers is defined
+          - Issue_servers | length > 0
+        fail_msg: >-
+          Survey/extra_var Issue_servers is required (fault server IP or hostname).
+
+    - name: "Add fault host into temporary group Issue_servers"
+      ansible.builtin.add_host:
+        name: "{{ Issue_servers }}"
+        groups: Issue_servers
+        ansible_host: "{{ Issue_servers }}"
+
+- name: "sos report analysis → Triage → n8n"
+  hosts: Issue_servers
+  gather_facts: true
+  become: true
+
+  vars:
+    xsos_bin: "/usr/local/bin/xsos"
+    sos_workdir: "/var/tmp"
+    # 默认值写死字符串；覆盖用 -e triage_server=... / JT Variables（勿写成 "{{ triage_server | default() }}"）
+    # 若 Triage 在 Mattermost DEMO 节点，常见为 10.210.65.14；按你现场改
+    triage_server: "10.210.65.103"
+    triage_report_root: "/xsos_report"
+    # 默认 webhook；覆盖用 -e n8n_webhook_url='http://...'
+    n8n_webhook_url: "http://10.210.65.103:8080/webhook/87029dcf-8b9a-4232-b6d9-b65243a19144"
+    # 时间戳精确到分钟 → /xsos_report/20261008-1430/
+    timestamp_min: "{{ ansible_date_time.date | replace('-', '') }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+    report_dirname: "{{ inventory_hostname }}-{{ timestamp_min }}"
+    md_basename: "sosreport_latest.md"
+    local_md_path: "{{ sos_workdir }}/{{ inventory_hostname }}-{{ timestamp_min }}-{{ md_basename }}"
+    controller_staging_dir: "/tmp/sos_report_staging"
+    max_md_bytes: 524288
+    log_context_lines: 5
+    sos_timeout_seconds: 1800
+
+  tasks:
+
+    # ===========================================
+    # 0) 前置检查
+    # ===========================================
+    - name: "Verify sos is available"
+      ansible.builtin.command: which sos
+      register: sos_which
+      changed_when: false
+      failed_when: sos_which.rc != 0
+
+    - name: "Verify xsos is installed"
+      ansible.builtin.stat:
+        path: "{{ xsos_bin }}"
+      register: xsos_stat
+
+    - name: "Fail early if xsos is missing"
+      ansible.builtin.fail:
+        msg: "{{ xsos_bin }} not found on {{ inventory_hostname }}. Install xsos first."
+      when: not xsos_stat.stat.exists or not xsos_stat.stat.executable
+
+    # ===========================================
+    # 1) 执行 sos report --batch
+    # ===========================================
+    - name: "Run sos report --batch (may take several minutes)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        sos report --batch 2>&1
+      args:
+        executable: /bin/bash
+      register: sos_run
+      async: "{{ sos_timeout_seconds }}"
+      poll: 15
+      changed_when: true
+
+    - name: "Parse sosreport archive path from sos output"
+      ansible.builtin.set_fact:
+        sos_archive: >-
+          {{
+            (sos_run.stdout | regex_findall('(/var/tmp/sosreport-[^\\s]+\\.tar\\.xz)') | last)
+            | default('', true)
+          }}
+
+    - name: "Fallback: pick newest sosreport archive under /var/tmp"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -1t {{ sos_workdir }}/sosreport-*.tar.xz 2>/dev/null | head -1
+      args:
+        executable: /bin/bash
+      register: sos_newest
+      changed_when: false
+      when: sos_archive | length == 0
+
+    - name: "Finalize sos_archive path"
+      ansible.builtin.set_fact:
+        sos_archive: "{{ sos_archive if (sos_archive | length > 0) else (sos_newest.stdout | trim) }}"
+
+    - name: "Fail if sos archive not found"
+      ansible.builtin.fail:
+        msg: "Could not locate sosreport-*.tar.xz under {{ sos_workdir }}"
+      when: sos_archive is not defined or sos_archive | length == 0
+
+    - name: "Show sos archive"
+      ansible.builtin.debug:
+        msg: "sos archive = {{ sos_archive }}"
+
+    # ===========================================
+    # 2) 解压 sos report
+    # ===========================================
+    - name: "Compute extract directory name"
+      ansible.builtin.set_fact:
+        sos_extract_dir: "{{ sos_workdir }}/{{ sos_archive | basename | regex_replace('\\.tar\\.xz$', '') }}"
+
+    - name: "Extract sos report archive"
+      ansible.builtin.shell: |
+        set -o pipefail
+        rm -rf "{{ sos_extract_dir }}"
+        mkdir -p "{{ sos_extract_dir }}"
+        tar -xJf "{{ sos_archive }}" -C "{{ sos_workdir }}"
+        # 部分 sos 包解压后目录名与 archive basename 一致；若不存在则取最新目录
+        if [ ! -d "{{ sos_extract_dir }}" ]; then
+          REAL="$(ls -1dt {{ sos_workdir }}/sosreport-* 2>/dev/null | head -1)"
+          echo "${REAL}"
+        else
+          echo "{{ sos_extract_dir }}"
+        fi
+      args:
+        executable: /bin/bash
+      register: extract_out
+      changed_when: true
+
+    - name: "Set real extract path"
+      ansible.builtin.set_fact:
+        sos_extract_dir: "{{ extract_out.stdout_lines | last | trim }}"
+
+    - name: "Fail if extract dir missing"
+      ansible.builtin.stat:
+        path: "{{ sos_extract_dir }}"
+      register: extract_stat
+
+    - name: "Assert extract dir exists"
+      ansible.builtin.fail:
+        msg: "Extract directory missing: {{ sos_extract_dir }}"
+      when: not extract_stat.stat.exists or not extract_stat.stat.isdir
+
+    # ===========================================
+    # 3–4) xsos --all + 高危日志摘录 → MD（≤512KiB）
+    # ===========================================
+    - name: "Generate Markdown report (xsos + filtered high-severity logs)"
+      ansible.builtin.shell: |
+        set -o pipefail
+        XSOS="{{ xsos_bin }}"
+        EXTRACT="{{ sos_extract_dir }}"
+        OUT="{{ local_md_path }}"
+        MAX="{{ max_md_bytes }}"
+        CTX="{{ log_context_lines }}"
+        HOST="{{ inventory_hostname }}"
+        ARCHIVE="{{ sos_archive }}"
+
+        {
+          echo "# sos / xsos report — ${HOST}"
+          echo ""
+          echo "- Host          : ${HOST}"
+          echo "- Generated     : $(date -Iseconds)"
+          echo "- sos archive   : ${ARCHIVE}"
+          echo "- Extract dir   : ${EXTRACT}"
+          echo "- xsos command  : ${XSOS} --all ${EXTRACT}"
+          echo "- Max MD size   : ${MAX} bytes"
+          echo ""
+          echo "## xsos --all"
+          echo ""
+          echo '```text'
+          "${XSOS}" --all "${EXTRACT}" 2>&1 || true
+          echo '```'
+          echo ""
+          echo "## High-severity log excerpts (ERROR/CRITICAL/FATAL/panic/Oops)"
+          echo ""
+          echo "_Filter: case-insensitive match; ±${CTX} lines context; truncated to keep total MD ≤ ${MAX} bytes._"
+          echo ""
+        } > "${OUT}"
+
+        # 常见日志路径（sos 树内）；不存在则跳过
+        LOG_CANDIDATES=(
+          "${EXTRACT}/var/log/messages"
+          "${EXTRACT}/var/log/syslog"
+          "${EXTRACT}/var/log/secure"
+          "${EXTRACT}/var/log/audit/audit.log"
+          "${EXTRACT}/var/log/dmesg"
+          "${EXTRACT}/sos_commands/logs/journalctl_--no-pager"
+          "${EXTRACT}/sos_commands/kernel/dmesg"
+        )
+
+        for LOGF in "${LOG_CANDIDATES[@]}"; do
+          [ -f "${LOGF}" ] || continue
+          CURRENT=$(wc -c < "${OUT}" | tr -d ' ')
+          REMAIN=$(( MAX - CURRENT - 2048 ))
+          if [ "${REMAIN}" -le 512 ]; then
+            echo "" >> "${OUT}"
+            echo "> Truncated: reached size budget before finishing all logs." >> "${OUT}"
+            break
+          fi
+          {
+            echo "### $(basename "${LOGF}")"
+            echo ""
+            echo "Source: \`${LOGF}\`"
+            echo ""
+            echo '```text'
+            # 高危关键字；限制单文件输出体积
+            grep -n -i -E -C "${CTX}" \
+              'error|critical|fatal|panic|oops|segfault|out of memory|oom-killer|blocked for more than|Call Trace' \
+              "${LOGF}" 2>/dev/null | head -c "${REMAIN}" || true
+            echo '```'
+            echo ""
+          } >> "${OUT}"
+        done
+
+        # 最终硬截断到 MAX 字节（保留文件头）
+        SIZE=$(wc -c < "${OUT}" | tr -d ' ')
+        if [ "${SIZE}" -gt "${MAX}" ]; then
+          TMP="${OUT}.trunc"
+          head -c "${MAX}" "${OUT}" > "${TMP}"
+          printf '\n\n> **TRUNCATED** at %s bytes to satisfy ≤%s budget.\n' "${MAX}" "${MAX}" >> "${TMP}"
+          mv -f "${TMP}" "${OUT}"
+        fi
+
+        wc -c < "${OUT}" | tr -d ' '
+      args:
+        executable: /bin/bash
+      register: md_build
+      changed_when: true
+
+    - name: "Stat generated Markdown"
+      ansible.builtin.stat:
+        path: "{{ local_md_path }}"
+      register: md_stat
+
+    - name: "Fail if Markdown too small or missing"
+      ansible.builtin.fail:
+        msg: "Failed to generate {{ local_md_path }} (size={{ md_stat.stat.size | default(0) }})"
+      when: not md_stat.stat.exists or (md_stat.stat.size | default(0) | int) < 100
+
+    - name: "Assert Markdown ≤ 512KiB"
+      ansible.builtin.assert:
+        that:
+          - md_stat.stat.size | int <= max_md_bytes
+        fail_msg: "Markdown exceeds {{ max_md_bytes }} bytes: {{ md_stat.stat.size }}"
+
+    - name: "Show local Markdown info"
+      ansible.builtin.debug:
+        msg:
+          - "Local MD : {{ local_md_path }}"
+          - "Size     : {{ md_stat.stat.size }} bytes"
+
+    # ===========================================
+    # 5) 上传到 Triage:/xsos_report/<timestamp>/
+    # ===========================================
+    - name: "Prepare staging dir on controller"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: "Fetch Markdown to controller"
+      ansible.builtin.fetch:
+        src: "{{ local_md_path }}"
+        dest: "{{ controller_staging_dir }}/{{ report_dirname }}-{{ md_basename }}"
+        flat: true
+
+    - name: "Ensure timestamped dir on Triage"
+      ansible.builtin.file:
+        path: "{{ triage_report_root }}/{{ report_dirname }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      delegate_to: "{{ triage_server }}"
+
+    - name: "Upload sosreport_latest.md to Triage"
+      ansible.builtin.copy:
+        src: "{{ controller_staging_dir }}/{{ report_dirname }}-{{ md_basename }}"
+        dest: "{{ triage_report_root }}/{{ report_dirname }}/{{ md_basename }}"
+        mode: "0644"
+        owner: root
+        group: root
+      delegate_to: "{{ triage_server }}"
+
+    - name: "Verify upload on Triage"
+      ansible.builtin.stat:
+        path: "{{ triage_report_root }}/{{ report_dirname }}/{{ md_basename }}"
+      delegate_to: "{{ triage_server }}"
+      register: remote_md_stat
+
+    - name: "Fail if upload verification failed"
+      ansible.builtin.fail:
+        msg: >-
+          Upload verification failed:
+          local={{ md_stat.stat.size }} bytes,
+          remote={{ remote_md_stat.stat.size | default('N/A') }} bytes
+      when: >-
+        not remote_md_stat.stat.exists or
+        (remote_md_stat.stat.size | default(0) | int) != (md_stat.stat.size | int)
+
+    - name: "Cleanup controller staging file"
+      ansible.builtin.file:
+        path: "{{ controller_staging_dir }}/{{ report_dirname }}-{{ md_basename }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    # ===========================================
+    # 6) POST to n8n webhook（参考已验证的 JT/EDA 写法；Respond Immediately 即可）
+    # ===========================================
+    - name: "POST to n8n webhook to trigger sos_report_analysis workflow"
+      ansible.builtin.uri:
+        url: "{{ n8n_webhook_url }}"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body:
+          alert_name: "sos_report_analysis"
+          alert_instance: "{{ inventory_hostname }}"
+          severity: "critical"
+          status: "firing"
+          target_host: "{{ inventory_hostname }}"
+          triage_server: "{{ triage_server }}"
+          report_dir: "{{ triage_report_root }}/{{ report_dirname }}"
+          report_file: "{{ triage_report_root }}/{{ report_dirname }}/{{ md_basename }}"
+          sos_archive: "{{ sos_archive }}"
+          md_bytes: "{{ md_stat.stat.size }}"
+        status_code: [200, 201, 202, 204]
+        timeout: 15
+      register: n8n_result
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: "Display n8n webhook invocation result"
+      ansible.builtin.debug:
+        msg: |
+          n8n webhook invocation result:
+          - Status     : {{ 'SUCCESS' if n8n_result is succeeded else 'FAILED' }}
+          - HTTP code  : {{ n8n_result.status | default('N/A') }}
+          - Response   : {{ n8n_result.json | default(n8n_result.content | default('')) }}
+          - Error msg  : {{ n8n_result.msg | default('') }}
+          - Webhook    : {{ n8n_webhook_url }}
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg:
+          - "✓ sos report analysis pipeline completed"
+          - "Source host : {{ inventory_hostname }}"
+          - "sos archive : {{ sos_archive }}"
+          - "Local MD    : {{ local_md_path }} ({{ md_stat.stat.size }} B)"
+          - "Triage path : {{ triage_server }}:{{ triage_report_root }}/{{ report_dirname }}/{{ md_basename }}"
+          - "n8n HTTP    : {{ n8n_result.status | default('N/A') }}"
+          - "n8n SSH tip : cat \"$(ls -dt {{ triage_report_root }}/*/ | head -1)/{{ md_basename }}\""
